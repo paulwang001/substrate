@@ -300,8 +300,7 @@ fn account_removal_does_not_remove_storage() {
 			let alice_contract_info = ContractInfo::Alive(RawAliveContractInfo {
 				trie_id: trie_id1.clone(),
 				storage_size: 0,
-				empty_pair_count: 0,
-				total_pair_count: 0,
+				pair_count: 0,
 				deduct_block: System::block_number(),
 				code_hash: H256::repeat_byte(1),
 				rent_allowance: 40,
@@ -315,8 +314,7 @@ fn account_removal_does_not_remove_storage() {
 			let bob_contract_info = ContractInfo::Alive(RawAliveContractInfo {
 				trie_id: trie_id2.clone(),
 				storage_size: 0,
-				empty_pair_count: 0,
-				total_pair_count: 0,
+				pair_count: 0,
 				deduct_block: System::block_number(),
 				code_hash: H256::repeat_byte(2),
 				rent_allowance: 40,
@@ -606,12 +604,8 @@ fn storage_size() {
 				4
 			);
 			assert_eq!(
-				bob_contract.total_pair_count,
+				bob_contract.pair_count,
 				1,
-			);
-			assert_eq!(
-				bob_contract.empty_pair_count,
-				0,
 			);
 
 			assert_ok!(Contracts::call(
@@ -630,12 +624,8 @@ fn storage_size() {
 				4 + 4
 			);
 			assert_eq!(
-				bob_contract.total_pair_count,
+				bob_contract.pair_count,
 				2,
-			);
-			assert_eq!(
-				bob_contract.empty_pair_count,
-				0,
 			);
 
 			assert_ok!(Contracts::call(
@@ -654,12 +644,8 @@ fn storage_size() {
 				4
 			);
 			assert_eq!(
-				bob_contract.total_pair_count,
+				bob_contract.pair_count,
 				1,
-			);
-			assert_eq!(
-				bob_contract.empty_pair_count,
-				0,
 			);
 		});
 }
@@ -692,11 +678,7 @@ fn empty_kv_pairs() {
 				0,
 			);
 			assert_eq!(
-				bob_contract.total_pair_count,
-				1,
-			);
-			assert_eq!(
-				bob_contract.empty_pair_count,
+				bob_contract.pair_count,
 				1,
 			);
 		});
