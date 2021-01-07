@@ -387,6 +387,7 @@ fn publish_discover_cycle() {
 /// stream terminates.
 #[test]
 fn terminate_when_event_stream_terminates() {
+	sp_tracing::try_init_simple();
 	let (dht_event_tx, dht_event_rx) = channel(1000);
 	let network: Arc<TestNetwork> = Arc::new(Default::default());
 	let key_store = KeyStore::new();
@@ -612,9 +613,10 @@ fn do_not_cache_addresses_without_peer_id() {
 
 #[test]
 fn addresses_to_publish_adds_p2p() {
+	env_logger::init();
 	let (_dht_event_tx, dht_event_rx) = channel(1000);
 	let network: Arc<TestNetwork> = Arc::new(Default::default());
-
+    log::trace!(".....----");
 	assert!(!matches!(
 		network.external_addresses().pop().unwrap().pop().unwrap(),
 		multiaddr::Protocol::P2p(_)

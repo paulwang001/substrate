@@ -49,6 +49,7 @@ pub struct MetricSources {
 }
 
 /// Dedicated metrics.
+#[derive(Debug)]
 pub struct Metrics {
 	// This list is ordered alphabetically
 	pub connections_closed_total: CounterVec<U64>,

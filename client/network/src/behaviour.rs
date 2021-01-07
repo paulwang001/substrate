@@ -17,7 +17,7 @@
 use crate::{
 	config::{ProtocolId, Role}, block_requests, light_client_handler,
 	peer_info, request_responses, discovery::{DiscoveryBehaviour, DiscoveryConfig, DiscoveryOut},
-	protocol::{message::Roles, CustomMessageOutcome, NotificationsSink, Protocol},
+	protocol::{message::Roles, CustomMessageOutcome, NotificationsSink, Protocol,GroupProto},
 	ObservedRole, DhtEvent, ExHashT,
 };
 
@@ -42,6 +42,8 @@ use std::{
 pub use crate::request_responses::{
 	ResponseFailure, InboundFailure, RequestFailure, OutboundFailure, RequestId, SendRequestError
 };
+use crate::protocol::transpp::trans_proto::TransEvent;
+use crate::protocol::GroupEventOut;
 
 /// General behaviour of the network. Combines all protocols together.
 #[derive(NetworkBehaviour)]
@@ -60,6 +62,9 @@ pub struct Behaviour<B: BlockT, H: ExHashT> {
 	block_requests: block_requests::BlockRequests<B>,
 	/// Light client request handling.
 	light_client_handler: light_client_handler::LightClientHandler<B>,
+
+	// group_proto:GroupProto,
+	// transpp:super::protocol::transpp::trans_proto::TransProto,
 
 	/// Queue of events to produce for the outside.
 	#[behaviour(ignore)]
@@ -182,15 +187,17 @@ impl<B: BlockT, H: ExHashT> Behaviour<B, H> {
 		light_client_handler: light_client_handler::LightClientHandler<B>,
 		disco_config: DiscoveryConfig,
 		request_response_protocols: Vec<request_responses::ProtocolConfig>,
+		// group_proto:GroupProto,
 	) -> Result<Self, request_responses::RegisterError> {
 		Ok(Behaviour {
 			substrate,
-			peer_info: peer_info::PeerInfoBehaviour::new(user_agent, local_public_key),
+			peer_info: peer_info::PeerInfoBehaviour::new(user_agent, local_public_key.clone()),
 			discovery: disco_config.finish(),
 			request_responses:
 				request_responses::RequestResponsesBehaviour::new(request_response_protocols.into_iter())?,
 			block_requests,
 			light_client_handler,
+			// group_proto,
 			events: VecDeque::new(),
 			role,
 		})
@@ -470,7 +477,7 @@ impl<B: BlockT, H: ExHashT> NetworkBehaviourEventProcess<peer_info::PeerInfoEven
 		for addr in listen_addrs {
 			self.discovery.add_self_reported_address(&peer_id, protocols.iter(), addr);
 		}
-		self.substrate.add_discovered_nodes(iter::once(peer_id));
+		self.substrate.add_discovered_nodes(iter::once(peer_id.clone()));
 	}
 }
 
@@ -485,7 +492,11 @@ impl<B: BlockT, H: ExHashT> NetworkBehaviourEventProcess<DiscoveryOut>
 				// implementation for `PeerInfoEvent`.
 			}
 			DiscoveryOut::Discovered(peer_id) => {
-				self.substrate.add_discovered_nodes(iter::once(peer_id));
+
+				//TODO same group?
+				self.substrate.add_discovered_nodes(iter::once(peer_id.clone()));
+				// self.group_proto.add_discovered_nodes(iter::once(peer_id.clone()));
+				// log::warn!("-------------{:?}----Discovered:{}/{}",self.group_proto.local_peer_id,self.substrate.num_connected_peers(),self.substrate.num_discovered_peers());
 			}
 			DiscoveryOut::ValueFound(results, duration) => {
 				self.events.push_back(BehaviourOut::Dht(DhtEvent::ValueFound(results), duration));
@@ -501,12 +512,14 @@ impl<B: BlockT, H: ExHashT> NetworkBehaviourEventProcess<DiscoveryOut>
 			}
 			DiscoveryOut::RandomKademliaStarted(protocols) => {
 				for protocol in protocols {
+					// log::warn!("RandomKademliaStarted:{:?}",protocol);
 					self.events.push_back(BehaviourOut::RandomKademliaStarted(protocol));
 				}
 			}
 		}
 	}
 }
+
 
 impl<B: BlockT, H: ExHashT> Behaviour<B, H> {
 	fn poll<TEv>(&mut self, _: &mut Context, _: &mut impl PollParameters) -> Poll<NetworkBehaviourAction<TEv, BehaviourOut<B>>> {
@@ -517,3 +530,50 @@ impl<B: BlockT, H: ExHashT> Behaviour<B, H> {
 		Poll::Pending
 	}
 }
+
+/*
+impl <B:BlockT,H:ExHashT> NetworkBehaviourEventProcess<super::protocol::GroupEventOut> for Behaviour<B,H> {
+	fn inject_event(&mut self, out: super::protocol::GroupEventOut) {
+
+		// let local_id = {
+		// 	&self.group_proto.local_peer_id
+		// };
+
+		match out {
+			GroupEventOut::Message { from_id, group_id, data } => {
+				let from_peer_id = PeerId::from_bytes(from_id.clone()).expect("");
+				let mut group_peers = vec![];
+				{
+					for p in self.group_proto.open_peers() {
+						group_peers.push(p.clone());
+					}
+				}
+				log::warn!("group_peers:{}",group_peers.len());
+				for p in group_peers {
+					log::warn!("====={:?}...to....{:?}",from_peer_id,&p);
+					self.group_proto.write_notification(&p,Cow::Borrowed("/group/1"),group_id.as_slice());
+				}
+			},
+			GroupEventOut::Sending { target, data } =>{
+				self.group_proto.write_notification(&target,Cow::Borrowed("/group/1"),data.as_slice());
+			},
+			GroupEventOut::Join { group_id, peer_id } =>{
+				let mut group_peers = vec![];
+				{
+					for p in self.group_proto.open_peers() {
+						group_peers.push(p.clone());
+					}
+				}
+				log::warn!("group_peers:{}",group_peers.len());
+				for p in group_peers {
+					log::warn!("JOIN====={:?}...to....{:?}--{}",peer_id.clone(),&p,group_id);
+					self.group_proto.write_notification(&p,Cow::Borrowed("/group/1"),peer_id.clone().into_bytes());
+				}
+			},
+			_ => {
+               log::warn!("group event:{:?}",out);
+			}
+		}
+	}
+}
+ */

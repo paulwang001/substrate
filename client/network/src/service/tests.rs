@@ -23,6 +23,8 @@ use futures::prelude::*;
 use sp_runtime::traits::{Block as BlockT, Header as _};
 use std::{borrow::Cow, sync::Arc, time::Duration};
 use substrate_test_runtime_client::{TestClientBuilder, TestClientBuilderExt as _};
+use codec::{Encode, Decode};
+use std::thread::Thread;
 
 type TestNetworkService = NetworkService<
 	substrate_test_runtime_client::runtime::Block,
@@ -98,7 +100,7 @@ fn build_test_full_node(config: config::NetworkConfiguration)
 		chain: client.clone(),
 		on_demand: None,
 		transaction_pool: Arc::new(crate::config::EmptyTransactionPool),
-		protocol_id: config::ProtocolId::from("/test-protocol-name"),
+		protocol_id: config::ProtocolId::from("shard"),
 		import_queue,
 		block_announce_validator: Box::new(
 			sp_consensus::block_validation::DefaultBlockAnnounceValidator,
@@ -119,6 +121,7 @@ fn build_test_full_node(config: config::NetworkConfiguration)
 }
 
 const PROTOCOL_NAME: Cow<'static, str> = Cow::Borrowed("/foo");
+const PROTOCOL_TEST: Cow<'static, str> = Cow::Borrowed("/group/1");
 
 /// Builds two nodes and their associated events stream.
 /// The nodes are connected together and have the `PROTOCOL_NAME` protocol registered.
@@ -148,9 +151,66 @@ fn build_nodes_one_proto()
 	(node1, events_stream1, node2, events_stream2)
 }
 
+fn build_group_nodes(group_count:u32,group_node_count:u32)
+	// -> Box<(dyn IntoIterator<Item=impl Stream<Item=Event>>, dyn IntoIterator<Item=(PeerId,Arc<TestNetworkService>)>)>
+    -> Option<(Vec<impl Stream<Item=Event>>,Vec<(PeerId,Arc<TestNetworkService>)>)>
+{
+	let mut groups = vec![];
+	for g in 0..group_count {
+		let listen_addr = config::build_multiaddr![Ip4([192, 168, 1, 27]), Tcp(3400_u16 + g as u16)];
+		let (mut node1, events_stream1) = build_test_full_node(config::NetworkConfiguration {
+			notifications_protocols: vec![PROTOCOL_TEST],
+			listen_addresses: vec![listen_addr.clone()],
+			in_peers:16,
+			out_peers:16,
+			transport: config::TransportConfig::Normal {
+				enable_mdns:false,
+				allow_private_ipv4:true,
+				wasm_external_transport:None,
+			},
+			.. config::NetworkConfiguration::new_local()
+		});
+		groups.push((node1,events_stream1,listen_addr));
+	}
+	let mut nodes = vec![];
+	let mut gx = 0_u16;
+	for (node1,_,group_addr) in groups.iter() {
+		let local = &node1.local_peer_id;
+		let group_id = format!("shard{}",gx);
+		node1.join_group(group_id.clone()).unwrap();
+        gx +=1;
+		for x in 0..group_node_count {
+			// let listen1_addr = config::build_multiaddr![Ip4([0, 0, 0, 0]), Tcp(0_u16)];
+			let listen1_addr = config::build_multiaddr![Ip4([192, 168, 1, 27]), Tcp(4000_u16 + (gx * 100) + x as u16)];
+			let (mut node2, _events_stream2) = build_test_full_node(config::NetworkConfiguration {
+				notifications_protocols: vec![PROTOCOL_TEST],
+				listen_addresses: vec![listen1_addr.clone()],
+				in_peers:16,
+				out_peers:16,
+				reserved_nodes: vec![config::MultiaddrWithPeerId {
+					multiaddr: group_addr.clone(),
+					peer_id: local.clone(),
+				}],
+				transport: config::TransportConfig::Normal {
+					enable_mdns:false,
+					allow_private_ipv4:true,
+					wasm_external_transport:None,
+				},
+				.. config::NetworkConfiguration::new_local()
+			});
+			node2.join_group(group_id.clone()).unwrap();
+			nodes.push((local.clone(),node2));
+		}
+	}
+    let groups = groups.into_iter().map(|(_,stream,_)|stream).collect::<Vec<_>>();
+
+	Some((groups,nodes))
+}
+
 #[ignore]
 #[test]
 fn notifications_state_consistent() {
+	env_logger::init();
 	// Runs two nodes and ensures that events are propagated out of the API in a consistent
 	// correct order, which means no notification received on a closed substream.
 
@@ -508,4 +568,59 @@ fn ensure_public_addresses_consistent_with_transport_not_memory() {
 		public_addresses: vec![public_address],
 		.. config::NetworkConfiguration::new("test-node", "test-client", Default::default(), None)
 	});
+}
+
+#[test]
+fn group_tests() {
+	env_logger::init();
+
+	let ret = build_group_nodes(4,4);
+	let (mut events,nodes) = ret.unwrap();
+
+	async_std::task::spawn(async move {
+		loop {
+			//group event
+			let mut events = events.iter_mut();
+			for evt in events {
+				if let Some(e) = evt.next().await {
+					match e {
+						Event::NotificationsReceived { remote, messages } =>{
+							for (proto,data) in messages{
+								let data = data.to_vec();
+								log::debug!("{:?}------------------>>>>>>{:?}==>{}",remote,proto,String::from_utf8_lossy(&data[..]));
+							}
+						},
+						Event::Dht(e)=>{
+
+						},
+						_=> {
+                           log::warn!("=================={:?}",e);
+						}
+					}
+				}
+			}
+
+		}
+	});
+
+	async_std::task::block_on(async move {
+		loop {
+			let mut nodes = nodes.iter();
+			async_std::task::sleep(Duration::from_millis(10000)).await;
+			for (g,n) in nodes {
+				let msg =
+				crate::protocol::message::Message::<substrate_test_runtime_client::runtime::Block>::Consensus(
+					crate::protocol::message::generic::ConsensusMessage {
+						protocol: [1,2,3,4],
+						data: "Hello".as_bytes().to_vec(),
+					}
+				);
+				let data = msg.encode();
+				//<RelayDataReq<B> as Encode>::encode(&dataRelayReq);
+				// let data = "Hello".to_string().into_bytes();
+				n.write_notification(g.clone(),PROTOCOL_TEST,data);
+			}
+		}
+	});
+
 }

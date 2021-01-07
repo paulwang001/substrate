@@ -258,7 +258,6 @@ mod schema;
 mod service;
 mod transport;
 mod utils;
-
 pub mod config;
 pub mod error;
 pub mod gossip;

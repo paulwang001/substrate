@@ -1087,6 +1087,9 @@ impl NetworkBehaviour for GenericProto {
 	fn inject_connected(&mut self, _: &PeerId) {
 	}
 
+	fn inject_disconnected(&mut self, _peer_id: &PeerId) {
+	}
+
 	fn inject_connection_established(&mut self, peer_id: &PeerId, conn: &ConnectionId, endpoint: &ConnectedPoint) {
 		match self.peers.entry(peer_id.clone()).or_insert(PeerState::Poisoned) {
 			// Requested | PendingRequest => Enabled
@@ -1385,72 +1388,6 @@ impl NetworkBehaviour for GenericProto {
 				error!(target: "sub-libp2p", "State of peer {} is poisoned", peer_id);
 				debug_assert!(false);
 			},
-		}
-	}
-
-	fn inject_disconnected(&mut self, _peer_id: &PeerId) {
-	}
-
-	fn inject_addr_reach_failure(&mut self, peer_id: Option<&PeerId>, addr: &Multiaddr, error: &dyn error::Error) {
-		trace!(target: "sub-libp2p", "Libp2p => Reach failure for {:?} through {:?}: {:?}", peer_id, addr, error);
-	}
-
-	fn inject_dial_failure(&mut self, peer_id: &PeerId) {
-		if let Entry::Occupied(mut entry) = self.peers.entry(peer_id.clone()) {
-			match mem::replace(entry.get_mut(), PeerState::Poisoned) {
-				// The peer is not in our list.
-				st @ PeerState::Backoff { .. } => {
-					trace!(target: "sub-libp2p", "Libp2p => Dial failure for {:?}", peer_id);
-					*entry.into_mut() = st;
-				},
-
-				// "Basic" situation: we failed to reach a peer that the peerset requested.
-				st @ PeerState::Requested |
-				st @ PeerState::PendingRequest { .. } => {
-					debug!(target: "sub-libp2p", "Libp2p => Dial failure for {:?}", peer_id);
-
-					debug!(target: "sub-libp2p", "PSM <= Dropped({:?})", peer_id);
-					self.peerset.dropped(peer_id.clone());
-
-					let now = Instant::now();
-					let ban_duration = match st {
-						PeerState::PendingRequest { timer_deadline, .. } if timer_deadline > now =>
-							cmp::max(timer_deadline - now, Duration::from_secs(5)),
-						_ => Duration::from_secs(5)
-					};
-
-					let delay_id = self.next_delay_id;
-					self.next_delay_id.0 += 1;
-					let delay = futures_timer::Delay::new(ban_duration);
-					let peer_id = peer_id.clone();
-					self.delays.push(async move {
-						delay.await;
-						(delay_id, peer_id)
-					}.boxed());
-
-					*entry.into_mut() = PeerState::Backoff {
-						timer: delay_id,
-						timer_deadline: now + ban_duration,
-					};
-				},
-
-				// We can still get dial failures even if we are already connected to the peer,
-				// as an extra diagnostic for an earlier attempt.
-				st @ PeerState::Disabled { .. } | st @ PeerState::Enabled { .. } |
-					st @ PeerState::DisabledPendingEnable { .. } | st @ PeerState::Incoming { .. } => {
-					debug!(target: "sub-libp2p", "Libp2p => Dial failure for {:?}", peer_id);
-					*entry.into_mut() = st;
-				},
-
-				PeerState::Poisoned => {
-					error!(target: "sub-libp2p", "State of {:?} is poisoned", peer_id);
-					debug_assert!(false);
-				},
-			}
-
-		} else {
-			// The peer is not in our list.
-			trace!(target: "sub-libp2p", "Libp2p => Dial failure for {:?}", peer_id);
 		}
 	}
 
@@ -1945,6 +1882,69 @@ impl NetworkBehaviour for GenericProto {
 					);
 				}
 			}
+		}
+	}
+
+	fn inject_addr_reach_failure(&mut self, peer_id: Option<&PeerId>, addr: &Multiaddr, error: &dyn error::Error) {
+		trace!(target: "sub-libp2p", "Libp2p => Reach failure for {:?} through {:?}: {:?}", peer_id, addr, error);
+	}
+
+	fn inject_dial_failure(&mut self, peer_id: &PeerId) {
+		if let Entry::Occupied(mut entry) = self.peers.entry(peer_id.clone()) {
+			match mem::replace(entry.get_mut(), PeerState::Poisoned) {
+				// The peer is not in our list.
+				st @ PeerState::Backoff { .. } => {
+					trace!(target: "sub-libp2p", "Libp2p => Dial failure for {:?}", peer_id);
+					*entry.into_mut() = st;
+				},
+
+				// "Basic" situation: we failed to reach a peer that the peerset requested.
+				st @ PeerState::Requested |
+				st @ PeerState::PendingRequest { .. } => {
+					debug!(target: "sub-libp2p", "Libp2p => Dial failure for {:?}", peer_id);
+
+					debug!(target: "sub-libp2p", "PSM <= Dropped({:?})", peer_id);
+					self.peerset.dropped(peer_id.clone());
+
+					let now = Instant::now();
+					let ban_duration = match st {
+						PeerState::PendingRequest { timer_deadline, .. } if timer_deadline > now =>
+							cmp::max(timer_deadline - now, Duration::from_secs(5)),
+						_ => Duration::from_secs(5)
+					};
+
+					let delay_id = self.next_delay_id;
+					self.next_delay_id.0 += 1;
+					let delay = futures_timer::Delay::new(ban_duration);
+					let peer_id = peer_id.clone();
+					self.delays.push(async move {
+						delay.await;
+						(delay_id, peer_id)
+					}.boxed());
+
+					*entry.into_mut() = PeerState::Backoff {
+						timer: delay_id,
+						timer_deadline: now + ban_duration,
+					};
+				},
+
+				// We can still get dial failures even if we are already connected to the peer,
+				// as an extra diagnostic for an earlier attempt.
+				st @ PeerState::Disabled { .. } | st @ PeerState::Enabled { .. } |
+					st @ PeerState::DisabledPendingEnable { .. } | st @ PeerState::Incoming { .. } => {
+					debug!(target: "sub-libp2p", "Libp2p => Dial failure for {:?}", peer_id);
+					*entry.into_mut() = st;
+				},
+
+				PeerState::Poisoned => {
+					error!(target: "sub-libp2p", "State of {:?} is poisoned", peer_id);
+					debug_assert!(false);
+				},
+			}
+
+		} else {
+			// The peer is not in our list.
+			trace!(target: "sub-libp2p", "Libp2p => Dial failure for {:?}", peer_id);
 		}
 	}
 

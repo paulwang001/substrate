@@ -51,6 +51,8 @@ enum Action {
 	SetPriorityGroup(String, HashSet<PeerId>),
 	AddToPriorityGroup(String, PeerId),
 	RemoveFromPriorityGroup(String, PeerId),
+	JoinGroup(String),
+	LeaveGroup(String),
 }
 
 /// Description of a reputation adjustment for a node.
@@ -127,6 +129,15 @@ impl PeersetHandle {
 	/// Remove a peer from a priority group.
 	pub fn remove_from_priority_group(&self, group_id: String, peer_id: PeerId) {
 		let _ = self.tx.unbounded_send(Action::RemoveFromPriorityGroup(group_id, peer_id));
+	}
+
+	/// Join local peer to group
+	pub fn join_group(&self,group_id:String) {
+		let _ = self.tx.unbounded_send(Action::JoinGroup(group_id));
+	}
+
+	pub fn leave_group(&self,group_id:String) {
+		let _ = self.tx.unbounded_send(Action::LeaveGroup(group_id));
 	}
 }
 
@@ -205,6 +216,9 @@ pub struct Peerset {
 	created: Instant,
 	/// Last time when we updated the reputations of connected nodes.
 	latest_time_update: Instant,
+
+	///Local Group
+	local_group:HashSet<String>,
 }
 
 impl Peerset {
@@ -227,6 +241,7 @@ impl Peerset {
 			message_queue: VecDeque::new(),
 			created: now,
 			latest_time_update: now,
+			local_group:HashSet::new(),
 		};
 
 		for node in config.priority_groups.into_iter().flat_map(|(_, l)| l) {
@@ -645,6 +660,13 @@ impl Peerset {
 	pub fn priority_group(&self, group_id: &str) -> Option<impl ExactSizeIterator<Item = &PeerId>> {
 		self.priority_groups.get(group_id).map(|l| l.iter())
 	}
+
+	pub fn on_join_group(&mut self,group_id:String) {
+       self.local_group.insert(group_id);
+	}
+	pub fn on_leave_group(&mut self,group_id:String) {
+		self.local_group.retain(|g| g != &group_id);
+	}
 }
 
 impl Stream for Peerset {
@@ -679,6 +701,10 @@ impl Stream for Peerset {
 					self.on_add_to_priority_group(&group_id, peer_id),
 				Action::RemoveFromPriorityGroup(group_id, peer_id) =>
 					self.on_remove_from_priority_group(&group_id, peer_id),
+				Action::JoinGroup(group_id) =>
+				    self.on_join_group(group_id),
+				Action::LeaveGroup(group_id) =>
+					self.on_leave_group(group_id),
 			}
 		}
 	}

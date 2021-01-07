@@ -48,6 +48,7 @@ use crate::{
 		Ready,
 		event::Event,
 		sync::SyncState,
+		GroupProto,
 	},
 	transport, ReputationChange,
 };
@@ -76,7 +77,7 @@ use libp2p::swarm::{
 use log::{error, info, trace, warn};
 use metrics::{Metrics, MetricSources, Histogram, HistogramVec};
 use parking_lot::Mutex;
-use sc_peerset::PeersetHandle;
+use sc_peerset::{PeersetHandle, Peerset};
 use sp_consensus::import_queue::{BlockImportError, BlockImportResult, ImportQueue, Link};
 use sp_runtime::traits::{Block as BlockT, NumberFor};
 use sp_utils::mpsc::{tracing_unbounded, TracingUnboundedReceiver, TracingUnboundedSender};
@@ -97,11 +98,14 @@ use std::{
 use wasm_timer::Instant;
 
 pub use behaviour::{ResponseFailure, InboundFailure, RequestFailure, OutboundFailure};
+use smallvec::alloc::collections::VecDeque;
 
 mod metrics;
 mod out_events;
 #[cfg(test)]
 mod tests;
+
+const BANNED_THRESHOLD: i32 = 82 * (i32::min_value() / 100);
 
 /// Substrate network service. Handles network IO and manages connectivity.
 pub struct NetworkService<B: BlockT + 'static, H: ExHashT> {
@@ -126,6 +130,10 @@ pub struct NetworkService<B: BlockT + 'static, H: ExHashT> {
 	/// Field extracted from the [`Metrics`] struct and necessary to report the
 	/// notifications-related metrics.
 	notifications_sizes_metric: Option<HistogramVec>,
+	local_groups: Arc<Mutex<HashSet<String>>>,
+	joining:Arc<Mutex<HashMap<record::Key,String>>>,
+	group_members:Arc<Mutex<HashMap<String,Vec<PeerId>>>>,
+	looking_members:Arc<Mutex<HashMap<record::Key,(String,Instant)>>>,
 	/// Marker to pin the `H` generic. Serves no purpose except to not break backwards
 	/// compatibility.
 	_marker: PhantomData<H>,
@@ -249,6 +257,8 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 			priority_groups,
 		};
 
+
+
 		// Private and public keys configuration.
 		let local_identity = params.network_config.node_key.clone().into_keypair()?;
 		let local_public = local_identity.public();
@@ -279,7 +289,6 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 			params.metrics_registry.as_ref(),
 			boot_node_ids.clone(),
 		)?;
-
 		// Build the swarm.
 		let (mut swarm, bandwidth): (Swarm<B, H>, _) = {
 			let user_agent = format!(
@@ -322,7 +331,20 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 
 				config
 			};
-
+			// let psm_config = sc_peerset::PeersetConfig {
+			// 	in_peers: params.network_config.in_peers,
+			// 	out_peers: params.network_config.out_peers,
+			// 	bootnodes:vec![],
+			// 	reserved_only: params.network_config.non_reserved_mode == NonReservedPeerMode::Deny,
+			// 	priority_groups:vec![],
+			// };
+			//
+			// let (group_psm,_) = Peerset::from_config(psm_config);
+            // let group = GroupProto::new(
+			// 	local_peer_id.clone(),
+			// 	group_psm,
+			// 	params.protocol_id.clone(),
+			// );
 			let mut behaviour = {
 				let result = Behaviour::new(
 					protocol,
@@ -333,6 +355,7 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 					light_client_handler,
 					discovery_config,
 					params.network_config.request_response_protocols,
+					// group,
 				);
 
 				match result {
@@ -344,6 +367,15 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 					},
 				}
 			};
+			// let group_notifi_protocol: Cow<'static, str> = Cow::from({
+			// 	let mut group_notifi_protocol = "".to_string();
+			// 	group_notifi_protocol.push_str(params.protocol_id.as_ref());
+			// 	group_notifi_protocol.push_str("/group/1");
+			// 	log::warn!("========================group_notifi_protocol:{}",&group_notifi_protocol);
+			// 	group_notifi_protocol
+			// });
+			//
+			// behaviour.register_notifications_protocol("/group/1");
 
 			for protocol in &params.network_config.notifications_protocols {
 				behaviour.register_notifications_protocol(protocol.clone());
@@ -411,10 +443,15 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 			peerset: peerset_handle,
 			local_peer_id,
 			to_worker,
+			group_members:Arc::new(Mutex::new(HashMap::<String,Vec<PeerId>>::new())),
+			local_groups:Arc::new(Mutex::new(HashSet::<String>::new())),
+			joining:Arc::new(Mutex::new(HashMap::<record::Key,String>::new())),
+			looking_members: Arc::new(Default::default()),
 			peers_notifications_sinks: peers_notifications_sinks.clone(),
 			notifications_sizes_metric:
 				metrics.as_ref().map(|metrics| metrics.notifications_sizes.clone()),
 			_marker: PhantomData,
+
 		});
 
 		Ok(NetworkWorker {
@@ -431,6 +468,8 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 			metrics,
 			boot_node_ids,
 			pending_requests: HashMap::with_capacity(128),
+			pending_get_group: Default::default(),
+			pending_put_group: Default::default()
 		})
 	}
 
@@ -668,7 +707,7 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkService<B, H> {
 				sink.clone()
 			} else {
 				// Notification silently discarded, as documented.
-				log::debug!(
+				log::warn!(
 					target: "sub-libp2p",
 					"Attempted to send notification on missing or closed substream: {:?}",
 					protocol,
@@ -1062,7 +1101,117 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkService<B, H> {
 			})
 			.collect::<Result<Vec<(PeerId, Multiaddr)>, String>>()
 	}
+
+	pub fn join_group(&self,group_id:String) ->Result<(),String> {
+		let mut local_groups = self.local_groups.lock();
+        if local_groups.contains(&group_id) {
+			trace!("joined:{}",group_id);
+			return Ok(());
+		}
+
+		let mut groups = local_groups.iter().fold(String::new(),|mut groups,group|{
+			if groups.is_empty() == false {
+				groups.push_str(",");
+			}
+			groups.push_str(&group[..]);
+			groups
+		});
+		if groups.is_empty() == false {
+			groups.push_str(",");
+		}
+		groups.push_str(&group_id[..]);
+		local_groups.insert(group_id.clone());
+		let key = self.local_peer_id.clone();
+		let mut key = key.into_bytes();
+		key.append(&mut vec![1_u8;8]);
+		let key = record::Key::from(key);
+		let msg = ServiceToWorkerMsg::<B,H>::PutValue(key.clone(),groups.as_bytes().to_vec());
+		self.to_worker.unbounded_send(msg).expect("");
+		let mut joining = self.joining.lock();
+		joining.insert(key,group_id);
+		// let get_msg = ServiceToWorkerMsg::<B,H>::GetValue(key);
+		// self.to_worker
+		// 	.unbounded_send(ServiceToWorkerMsg::AnnounceGroup(self.local_peer_id.clone(),group_id.into_bytes()));
+		log::debug!("joining...");
+		Ok(())
+	}
+
+	///get the peer group on ConnectionEstablished
+	pub fn get_peer_group(&self,peer_id:PeerId,direction:String) {
+		let mut key = peer_id.into_bytes();
+		key.append(&mut vec![1_u8;8]);
+		let key = record::Key::from(key);
+		let get_msg = ServiceToWorkerMsg::<B,H>::GetValue(key.clone());
+		let mut looking_members = self.looking_members.lock();
+		looking_members.insert(key,(direction,Instant::now()));
+		self.to_worker.unbounded_send(get_msg).expect("");
+		log::debug!("peer group...");
+	}
+
+	/// query group of peer
+	pub fn on_group_member(&self,key:record::Key,group_ids:Option<String>){
+		if group_ids.is_some() {
+			let mut group_members = self.group_members.lock();
+			let groups = group_ids.unwrap_or("".to_string());
+			let local_groups = self.local_groups.lock();
+
+			let mut looking_members = self.looking_members.lock();
+			let (dir,_created) = looking_members.remove(key.as_ref()).unwrap_or((String::new(),Instant::now()));
+			let mut in_group_num = 1;
+			let k = key.to_vec();
+			let (peer_id,_) = k.split_at(k.len()-8);
+			let peer_id = PeerId::from_bytes(peer_id.to_vec()).expect("");
+			groups.split(",").for_each(|g|{
+
+                log::debug!("group is {} for peer {:?}",&groups,&peer_id);
+				if local_groups.contains(g) {
+					let members = group_members.entry(g.to_string()).or_insert(vec![]);
+					members.push(peer_id.clone());
+					if "out" == &dir[..] {
+						&self.peerset.add_to_priority_group(g.to_string(),peer_id.clone());
+					}
+					in_group_num +=1 ;
+				}
+				else{
+					//try disconnect peer_id of other group peer
+					if "out" == &dir[..] {
+						&self.peerset.remove_from_priority_group(g.to_string(), peer_id.clone());
+					}
+				}
+			});
+			if in_group_num == 1 {
+				&self.peerset.report_peer(peer_id,ReputationChange::new(-(1<<2), "other group"));
+			}
+			else{
+				&self.peerset.report_peer(peer_id,ReputationChange::new(1 << in_group_num, "other group"));
+			}
+		}
+
+	}
+
+	pub fn on_local_join(&self,key:record::Key) {
+		let mut joining = self.joining.lock();
+		if let Some(group_id) = joining.remove(key.as_ref()) {
+			log::debug!("{:?} joined to group {}.",self.local_peer_id,&group_id);
+			let mut local_groups = self.local_groups.lock();
+			local_groups.insert(group_id);
+
+		}
+	}
+
+	pub fn local_groups(&self) -> Vec<String>{
+		let local_groups= self.local_groups.lock();
+		let mut groups  = vec![];
+		local_groups.iter().for_each(|g|{
+			groups.push(g.clone());
+		});
+		groups
+	}
+
+
 }
+
+
 
 impl<B: BlockT + 'static, H: ExHashT> sp_consensus::SyncOracle
 	for NetworkService<B, H>
@@ -1202,6 +1351,7 @@ enum ServiceToWorkerMsg<B: BlockT, H: ExHashT> {
 	},
 	DisconnectPeer(PeerId),
 	NewBestBlockImported(B::Hash, NumberFor<B>),
+	// AnnounceGroup(PeerId,Vec<u8>),
 }
 
 /// Main network worker. Must be polled in order for the network to advance.
@@ -1241,6 +1391,9 @@ pub struct NetworkWorker<B: BlockT + 'static, H: ExHashT> {
 	/// For each peer and protocol combination, an object that allows sending notifications to
 	/// that peer. Shared with the [`NetworkService`].
 	peers_notifications_sinks: Arc<Mutex<HashMap<(PeerId, Cow<'static, str>), NotificationsSink>>>,
+
+	pending_get_group:VecDeque<(record::Key,Instant)>,
+	pending_put_group:VecDeque<(record::Key,Vec<u8>,Instant)>,
 }
 
 impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
@@ -1301,8 +1454,14 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 					this.network_service.user_protocol_mut().propagate_transactions(),
 				ServiceToWorkerMsg::GetValue(key) =>
 					this.network_service.get_value(&key),
-				ServiceToWorkerMsg::PutValue(key, value) =>
-					this.network_service.put_value(key, value),
+				ServiceToWorkerMsg::PutValue(key, value) =>{
+					let k = key.to_vec();
+					let (_peer_id,proto) = k.split_at(k.len()-8);
+					if proto == &[1_u8; 8] {
+						this.pending_put_group.push_back((key.clone(),value.clone(),Instant::now()));
+					}
+					this.network_service.put_value(key, value);
+				},
 				ServiceToWorkerMsg::AddKnownAddress(peer_id, addr) =>
 					this.network_service.add_known_address(peer_id, addr),
 				ServiceToWorkerMsg::SyncFork(peer_ids, hash, number) =>
@@ -1349,6 +1508,26 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 			if num_iterations >= 1000 {
 				cx.waker().wake_by_ref();
 				break;
+			}
+
+			if let Some((pending_key,timer)) = this.pending_get_group.pop_front() {
+				if timer.elapsed().as_secs() > 10 {
+					log::warn!("Retrying get peer group...");
+					this.network_service.get_value(&pending_key);
+				}
+				else{
+					this.pending_get_group.push_back((pending_key,timer));
+				}
+			}
+
+			if let Some((pending_key,data,timer)) = this.pending_put_group.pop_front() {
+				if timer.elapsed().as_secs() > 10 {
+					log::debug!("Retrying put peer group...");
+					this.network_service.put_value(pending_key.clone(),data.clone());
+				}
+				else{
+					this.pending_put_group.push_back((pending_key,data,timer));
+				}
 			}
 
 			// Process the next action coming from the network.
@@ -1540,17 +1719,70 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 						metrics.kademlia_query_duration.with_label_values(&[query_type])
 							.observe(duration.as_secs_f64());
 					}
+                    let copy_event = event.clone();
+					this.event_streams.send(Event::Dht(copy_event));
+					match event {
+						DhtEvent::ValueFound(vals) => {
+							for (k,data) in vals {
+								let key = k.to_vec();
+								let (_peer_id,proto) = key.split_at(key.len()-8);
+								if proto == &[1_u8; 8] {
+									//is group query
+									if let Ok(ids) = String::from_utf8(data){
+										this.service.clone().on_group_member(k,Some(ids));
+									};
+								}
+							}
+						},
+						DhtEvent::ValueNotFound(k) =>{
+							let key = k.to_vec();
+							let (peer_id,proto) = key.split_at(key.len()-8);
+							if proto == &[1_u8; 8] {
+								log::warn!("group not found:{:?}",PeerId::from_bytes(peer_id.to_vec()).unwrap());
+								this.pending_get_group.push_back((k,Instant::now()));
+							}
+						},
+						DhtEvent::ValuePut(key) =>{
+							let k = key.to_vec();
+							let (peer_id,proto) = k.split_at(k.len()-8);
+							if proto == &[1_u8; 8] {
+								this.pending_put_group.retain(|(k,_data,_)| {
 
-					this.event_streams.send(Event::Dht(event));
+									k != &key
+								});
+								this.service.clone().on_local_join(key);
+								log::debug!("ValuePut---->for peer: {:?}",PeerId::from_bytes(peer_id.to_vec()).unwrap());
+							}
+
+
+						},
+						DhtEvent::ValuePutFailed(key) =>{
+							let k = key.to_vec();
+							let (peer_id,proto) = k.split_at(k.len()-8);
+							if proto == &[1_u8; 8] {
+								this.pending_put_group.retain(|(k,data,_)| {
+									if &key == k {
+										log::warn!("{}",String::from_utf8(data.clone()).unwrap());
+									}
+									true
+								});
+								log::debug!("ValuePutFailed---->for peer: {:?}",PeerId::from_bytes(peer_id.to_vec()).unwrap());
+							}
+						}
+					}
+
 				},
 				Poll::Ready(SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established }) => {
-					trace!(target: "sub-libp2p", "Libp2p => Connected({:?})", peer_id);
+					trace!(target: "sub-libp2p", "Libp2p => Connected({:?})", &peer_id);
+					let direction = match endpoint {
+						ConnectedPoint::Dialer { .. } => "out",
+						ConnectedPoint::Listener { .. } => "in",
+					};
+					//[ADD] query peer group from kad if is out
+					this.service.clone().get_peer_group(peer_id,direction.to_string());
 
 					if let Some(metrics) = this.metrics.as_ref() {
-						let direction = match endpoint {
-							ConnectedPoint::Dialer { .. } => "out",
-							ConnectedPoint::Listener { .. } => "in",
-						};
+
 						metrics.connections_opened_total.with_label_values(&[direction]).inc();
 
 						if num_established.get() == 1 {
@@ -1559,20 +1791,25 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 					}
 				},
 				Poll::Ready(SwarmEvent::ConnectionClosed { peer_id, cause, endpoint, num_established }) => {
-					trace!(target: "sub-libp2p", "Libp2p => Disconnected({:?}, {:?})", peer_id, cause);
+					trace!(target: "sub-libp2p", "Libp2p => Disconnected({:?}, {:?})", &peer_id, cause);
+					let direction = match endpoint {
+						ConnectedPoint::Dialer { .. } => "out",
+						ConnectedPoint::Listener { .. } => "in",
+					};
+					// ADD remove peer from group members
+					if direction == "out" {
+						let mut group_members = this.service.group_members.lock();
+						let _ = group_members.iter_mut().flat_map(|(_,members)|{
+                           members.retain(|m|m != &peer_id);
+						   members.into_iter()
+						}).collect::<Vec<_>>();
+					}
 					if let Some(metrics) = this.metrics.as_ref() {
-						let direction = match endpoint {
-							ConnectedPoint::Dialer { .. } => "out",
-							ConnectedPoint::Listener { .. } => "in",
-						};
+
 						let reason = match cause {
 							Some(ConnectionError::IO(_)) => "transport-error",
-							Some(ConnectionError::Handler(NodeHandlerWrapperError::Handler(EitherError::A(EitherError::A(
-								EitherError::A(EitherError::A(EitherError::B(
-								EitherError::A(PingFailure::Timeout))))))))) => "ping-timeout",
-							Some(ConnectionError::Handler(NodeHandlerWrapperError::Handler(EitherError::A(EitherError::A(
-								EitherError::A(EitherError::A(EitherError::A(
-								NotifsHandlerError::SyncNotificationsClogged)))))))) => "sync-notifications-clogged",
+							// Some(ConnectionError::Handler(NodeHandlerWrapperError::Handler(_))) => "ping-timeout",
+							// Some(ConnectionError::Handler(NodeHandlerWrapperError::Handler(_))) => "sync-notifications-clogged",
 							Some(ConnectionError::Handler(NodeHandlerWrapperError::Handler(_))) => "protocol-error",
 							Some(ConnectionError::Handler(NodeHandlerWrapperError::KeepAliveTimeout)) => "keep-alive-timeout",
 							None => "actively-closed",
@@ -1685,7 +1922,11 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 					}
 				},
 			};
+
+
 		}
+
+
 
 		let num_connected_peers = this.network_service.user_protocol_mut().num_connected_peers();
 
@@ -1725,6 +1966,7 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 			metrics.pending_connections.set(
 				Swarm::network_info(&this.network_service).connection_counters().num_pending() as u64
 			);
+			log::info!("{:?}",metrics);
 		}
 
 		Poll::Pending

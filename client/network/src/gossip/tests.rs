@@ -149,6 +149,7 @@ fn build_nodes_one_proto()
 
 #[test]
 fn basic_works() {
+	env_logger::init();
 	const NUM_NOTIFS: usize = 256;
 
 	let (node1, mut events_stream1, node2, mut events_stream2) = build_nodes_one_proto();
@@ -174,6 +175,7 @@ fn basic_works() {
 				async_std::task::sleep(Duration::from_millis(rand::random::<u64>() % 750)).await;
 			}
 		}
+		async_std::task::sleep(Duration::from_millis(10 * 1000)).await;
 	});
 
 	async_std::task::block_on(async move {

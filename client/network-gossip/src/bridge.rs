@@ -377,6 +377,7 @@ mod tests {
 
 	#[test]
 	fn keeps_multiple_subscribers_per_topic_updated_with_both_old_and_new_messages() {
+		env_logger::init();
 		let topic = H256::default();
 		let protocol = Cow::Borrowed("/my_protocol");
 		let remote_peer = PeerId::random();
@@ -444,6 +445,7 @@ mod tests {
 
 	#[test]
 	fn forwarding_to_different_size_and_topic_channels() {
+		env_logger::init();
 		#[derive(Clone, Debug)]
 		struct ChannelLengthAndTopic{
 			length: usize,

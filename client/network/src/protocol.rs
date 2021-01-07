@@ -62,8 +62,8 @@ mod generic_proto;
 pub mod message;
 pub mod event;
 pub mod sync;
-
-pub use generic_proto::{NotificationsSink, Ready, NotifsHandlerError};
+pub mod transpp;
+pub use generic_proto::{NotificationsSink, Ready, NotifsHandlerError,GroupProto,GroupEventOut};
 
 const REQUEST_TIMEOUT_SEC: u64 = 40;
 /// Interval at which we perform time based maintenance
@@ -265,6 +265,7 @@ pub struct PeerInfo<B: BlockT> {
 	pub best_hash: B::Hash,
 	/// Peer best block number
 	pub best_number: <B::Header as HeaderT>::Number,
+	pub group_number:Option<<B::Header as HeaderT>::Number>,
 }
 
 /// Data necessary to create a context.
@@ -419,8 +420,10 @@ impl<B: BlockT, H: ExHashT> Protocol<B, H> {
 				best_hash,
 				genesis_hash,
 			).encode();
+
+			let generic_proto =
 			GenericProto::new(
-				local_peer_id,
+				local_peer_id.clone(),
 				protocol_id.clone(),
 				versions,
 				build_status_message::<B>(&config, best_number, best_hash, genesis_hash),
@@ -429,7 +432,12 @@ impl<B: BlockT, H: ExHashT> Protocol<B, H> {
 				// one carrying the handshake reported in the `CustomProtocolOpen` event.
 				iter::once((block_announces_protocol.clone(), block_announces_handshake))
 					.chain(iter::once((transactions_protocol.clone(), vec![]))),
-			)
+			);
+			// GroupProto::new(
+			// 	local_peer_id,
+            //     generic_proto,
+			// )
+			generic_proto
 		};
 
 		let protocol = Protocol {
@@ -465,6 +473,15 @@ impl<B: BlockT, H: ExHashT> Protocol<B, H> {
 		Ok((protocol, peerset_handle))
 	}
 
+	///
+	pub fn write_notification(
+		&mut self,
+		target: &PeerId,
+		protocol_name: Cow<'static, str>,
+		message: impl Into<Vec<u8>>,
+	) {
+		self.behaviour.write_notification(target,protocol_name,message)
+	}
 	/// Returns the list of all the peers we have an open channel to.
 	pub fn open_peers(&self) -> impl Iterator<Item = &PeerId> {
 		self.behaviour.open_peers()
@@ -625,7 +642,6 @@ impl<B: BlockT, H: ExHashT> Protocol<B, H> {
 			GenericMessage::RemoteReadRequest(_) |
 			GenericMessage::RemoteHeaderRequest(_) |
 			GenericMessage::RemoteChangesRequest(_) |
-			GenericMessage::Consensus(_) |
 			GenericMessage::ConsensusBatch(_) => {
 				debug!(
 					target: "sub-libp2p",
@@ -634,6 +650,9 @@ impl<B: BlockT, H: ExHashT> Protocol<B, H> {
 				);
 				self.disconnect_peer(&who);
 				self.peerset_handle.report_peer(who, rep::BAD_PROTOCOL);
+			},
+			GenericMessage::Consensus(c)=>{
+				warn!("===============Consensus:{:?}",c);
 			},
 		}
 
@@ -857,12 +876,13 @@ impl<B: BlockT, H: ExHashT> Protocol<B, H> {
 				return CustomMessageOutcome::None;
 			}
 		}
-
+		log::debug!("best_number--->{:?}",status.best_number);
 		let peer = Peer {
 			info: PeerInfo {
 				roles: status.roles,
 				best_hash: status.best_hash,
-				best_number: status.best_number
+				best_number: status.best_number,
+				group_number:None,
 			},
 			block_request: None,
 			known_transactions: LruHashSet::new(NonZeroUsize::new(MAX_KNOWN_TRANSACTIONS)
@@ -1415,10 +1435,12 @@ impl<B: BlockT, H: ExHashT> NetworkBehaviour for Protocol<B, H> {
 	}
 
 	fn inject_connected(&mut self, peer_id: &PeerId) {
+		// log::warn!("inject_connected:{:?}",peer_id);
 		self.behaviour.inject_connected(peer_id)
 	}
 
 	fn inject_disconnected(&mut self, peer_id: &PeerId) {
+		// log::warn!("inject_disconnected:{:?}",peer_id);
 		self.behaviour.inject_disconnected(peer_id)
 	}
 

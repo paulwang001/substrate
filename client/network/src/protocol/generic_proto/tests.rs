@@ -32,10 +32,13 @@ use libp2p::swarm::{
 	NetworkBehaviour, NetworkBehaviourAction
 };
 use std::{error, io, iter, task::{Context, Poll}, time::Duration};
+// use crate::protocol::transpp::transpp::Transp2pBehaviour;
+use crate::protocol::transpp::buckets::BucketTable;
+use crate::protocol::generic_proto::handler::NotifsHandlerOut;
 
 /// Builds two nodes that have each other as bootstrap nodes.
 /// This is to be used only for testing, and a panic will happen if something goes wrong.
-fn build_nodes() -> (Swarm<CustomProtoWithAddr>, Swarm<CustomProtoWithAddr>) {
+fn build_nodes() -> ((Swarm<CustomProtoWithAddr>,PeerId), (Swarm<CustomProtoWithAddr>,PeerId)) {
 	let mut out = Vec::with_capacity(2);
 
 	let keypairs: Vec<_> = (0..2).map(|_| identity::Keypair::generate_ed25519()).collect();
@@ -74,11 +77,13 @@ fn build_nodes() -> (Swarm<CustomProtoWithAddr>, Swarm<CustomProtoWithAddr>) {
 			priority_groups: Vec::new(),
 		});
 
-		let behaviour = CustomProtoWithAddr {
+		let mut behaviour = CustomProtoWithAddr {
 			inner: GenericProto::new(
-				local_peer_id, "test", &[1], vec![], peerset,
+				local_peer_id.clone(), "test", &[1], vec![], peerset,
 				iter::once(("/foo".into(), Vec::new()))
 			),
+			bucket_table: BucketTable::new(local_peer_id.clone()),
+			local_peer_id:local_peer_id.clone(),
 			addrs: addrs
 				.iter()
 				.enumerate()
@@ -89,6 +94,14 @@ fn build_nodes() -> (Swarm<CustomProtoWithAddr>, Swarm<CustomProtoWithAddr>) {
 				})
 				.collect(),
 		};
+		// behaviour.register_notif_protocol("test",vec![]);
+		// let behaviour = Transp2pBehaviour::new(
+		// 	keypair.public(),
+		//     "trans",
+		// 	 &[1],
+		// 	peerset,
+		//    iter::once(("/foo".into(), Vec::new()))
+		// );
 
 		let mut swarm = Swarm::new(
 			transport,
@@ -96,7 +109,7 @@ fn build_nodes() -> (Swarm<CustomProtoWithAddr>, Swarm<CustomProtoWithAddr>) {
 			keypairs[index].public().into_peer_id()
 		);
 		Swarm::listen_on(&mut swarm, addrs[index].clone()).unwrap();
-		out.push(swarm);
+		out.push((swarm,local_peer_id.clone()));
 	}
 
 	// Final output
@@ -109,7 +122,16 @@ fn build_nodes() -> (Swarm<CustomProtoWithAddr>, Swarm<CustomProtoWithAddr>) {
 /// Wraps around the `CustomBehaviour` network behaviour, and adds hardcoded node addresses to it.
 struct CustomProtoWithAddr {
 	inner: GenericProto,
+	bucket_table:BucketTable,
 	addrs: Vec<(PeerId, Multiaddr)>,
+	local_peer_id:PeerId,
+}
+
+impl CustomProtoWithAddr{
+	pub fn send_test(&mut self,target:&PeerId) {
+		log::warn!("from:{:?},target:{:?}",self.local_peer_id,target);
+		self.inner.write_notification(target,"/foo".into(),"hello");
+	}
 }
 
 impl std::ops::Deref for CustomProtoWithAddr {
@@ -128,7 +150,7 @@ impl std::ops::DerefMut for CustomProtoWithAddr {
 
 impl NetworkBehaviour for CustomProtoWithAddr {
 	type ProtocolsHandler = <GenericProto as NetworkBehaviour>::ProtocolsHandler;
-	type OutEvent = <GenericProto as NetworkBehaviour>::OutEvent;
+	type OutEvent = GenericProtoOut;
 
 	fn new_handler(&mut self) -> Self::ProtocolsHandler {
 		self.inner.new_handler()
@@ -145,10 +167,15 @@ impl NetworkBehaviour for CustomProtoWithAddr {
 	}
 
 	fn inject_connected(&mut self, peer_id: &PeerId) {
+		log::warn!("connected:{:?}",peer_id);
+        self.bucket_table.PeerConnected(peer_id);
 		self.inner.inject_connected(peer_id)
 	}
 
 	fn inject_disconnected(&mut self, peer_id: &PeerId) {
+		log::warn!("inject_disconnected:{:?}",peer_id);
+		self.bucket_table.PeerDisconnected(peer_id);
+
 		self.inner.inject_disconnected(peer_id)
 	}
 
@@ -166,7 +193,19 @@ impl NetworkBehaviour for CustomProtoWithAddr {
 		connection: ConnectionId,
 		event: <<Self::ProtocolsHandler as IntoProtocolsHandler>::Handler as ProtocolsHandler>::OutEvent
 	) {
-		self.inner.inject_event(peer_id, connection, event)
+		match event {
+			NotifsHandlerOut::Notification{ protocol_name, message } => {
+
+				log::warn!("From:{:?},Notifi---->{:?},{},{}",self.local_peer_id,peer_id,protocol_name,message.len());
+			},
+			NotifsHandlerOut::CustomMessage { message } =>{
+				log::warn!("CustomMessage---->{:?},{}",peer_id,message.len());
+			},
+			_=>{
+				log::info!("OutEvent---->{:?},{:?}",peer_id,event);
+				self.inner.inject_event(peer_id, connection, event)
+			}
+		}
 	}
 
 	fn poll(
@@ -215,8 +254,8 @@ impl NetworkBehaviour for CustomProtoWithAddr {
 fn reconnect_after_disconnect() {
 	// We connect two nodes together, then force a disconnect (through the API of the `Service`),
 	// check that the disconnect worked, and finally check whether they successfully reconnect.
-
-	let (mut service1, mut service2) = build_nodes();
+    env_logger::init();
+	let ((mut service1,p1), (mut service2,p2)) = build_nodes();
 
 	// For this test, the services can be in the following states.
 	#[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -283,10 +322,11 @@ fn reconnect_after_disconnect() {
 				break;
 			}
 		}
-
+		service1.send_test(&p2);
 		// Now that the two services have disconnected and reconnected, wait for 3 seconds and
 		// check whether they're still connected.
 		let mut delay = futures_timer::Delay::new(Duration::from_secs(3));
+
 
 		loop {
 			// Grab next event from services.

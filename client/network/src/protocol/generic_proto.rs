@@ -22,8 +22,9 @@
 
 pub use self::behaviour::{GenericProto, GenericProtoOut};
 pub use self::handler::{NotifsHandlerError, NotificationsSink, Ready};
-
+pub use self::group::{GroupProto,GroupEventOut};
 mod behaviour;
 mod handler;
 mod upgrade;
+mod group;
 mod tests;
