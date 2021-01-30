@@ -262,6 +262,8 @@ pub mod config;
 pub mod error;
 pub mod gossip;
 pub mod network_state;
+pub mod group;
+// mod message;
 
 #[doc(inline)]
 pub use libp2p::{multiaddr, Multiaddr, PeerId};

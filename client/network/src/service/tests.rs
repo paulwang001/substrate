@@ -20,11 +20,16 @@ use crate::{config, Event, NetworkService, NetworkWorker};
 
 use libp2p::PeerId;
 use futures::prelude::*;
-use sp_runtime::traits::{Block as BlockT, Header as _};
+use sp_runtime::traits::{Block as BlockT, Header as _,HashFor};
 use std::{borrow::Cow, sync::Arc, time::Duration};
 use substrate_test_runtime_client::{TestClientBuilder, TestClientBuilderExt as _};
 use codec::{Encode, Decode};
 use std::thread::Thread;
+use crate::service::GroupRoles;
+use futures::channel::mpsc::{unbounded,UnboundedSender,UnboundedReceiver};
+use futures::task::Poll;
+use rand::prelude::SliceRandom;
+use rand::RngCore;
 
 type TestNetworkService = NetworkService<
 	substrate_test_runtime_client::runtime::Block,
@@ -36,12 +41,12 @@ type TestNetworkService = NetworkService<
 ///
 /// > **Note**: We return the events stream in order to not possibly lose events between the
 /// >			construction of the service and the moment the events stream is grabbed.
-fn build_test_full_node(config: config::NetworkConfiguration)
+fn build_test_full_node(config: config::NetworkConfiguration,pool:futures::executor::ThreadPool)
 	-> (Arc<TestNetworkService>, impl Stream<Item = Event>)
 {
 	let client = Arc::new(
 		TestClientBuilder::with_default_backend()
-			.build_with_longest_chain()
+			.build_pool_longest_chain(pool.clone())
 			.0,
 	);
 
@@ -89,7 +94,7 @@ fn build_test_full_node(config: config::NetworkConfiguration)
 		PassThroughVerifier(false),
 		Box::new(client.clone()),
 		None,
-		&sp_core::testing::TaskExecutor::new(),
+		&sp_core::testing::TaskExecutor::new_with_pool(pool.clone()),
 		None,
 	));
 
@@ -105,7 +110,7 @@ fn build_test_full_node(config: config::NetworkConfiguration)
 		block_announce_validator: Box::new(
 			sp_consensus::block_validation::DefaultBlockAnnounceValidator,
 		),
-		metrics_registry: None,
+		metrics_registry: Some(prometheus_endpoint::Registry::default()),
 	})
 	.unwrap();
 
@@ -120,6 +125,10 @@ fn build_test_full_node(config: config::NetworkConfiguration)
 	(service, event_stream)
 }
 
+fn build_pool()->futures::executor::ThreadPool{
+	futures::executor::ThreadPoolBuilder::new().pool_size(48).create().expect("Failed to create thread pool!!!!")
+}
+
 const PROTOCOL_NAME: Cow<'static, str> = Cow::Borrowed("/foo");
 const PROTOCOL_TEST: Cow<'static, str> = Cow::Borrowed("/group/1");
 
@@ -129,13 +138,13 @@ fn build_nodes_one_proto()
 	-> (Arc<TestNetworkService>, impl Stream<Item = Event>, Arc<TestNetworkService>, impl Stream<Item = Event>)
 {
 	let listen_addr = config::build_multiaddr![Memory(rand::random::<u64>())];
-
+	let pool = build_pool();
 	let (node1, events_stream1) = build_test_full_node(config::NetworkConfiguration {
 		notifications_protocols: vec![PROTOCOL_NAME],
 		listen_addresses: vec![listen_addr.clone()],
 		transport: config::TransportConfig::MemoryOnly,
 		.. config::NetworkConfiguration::new_local()
-	});
+	},pool.clone());
 
 	let (node2, events_stream2) = build_test_full_node(config::NetworkConfiguration {
 		notifications_protocols: vec![PROTOCOL_NAME],
@@ -146,47 +155,67 @@ fn build_nodes_one_proto()
 		}],
 		transport: config::TransportConfig::MemoryOnly,
 		.. config::NetworkConfiguration::new_local()
-	});
+	},pool);
 
 	(node1, events_stream1, node2, events_stream2)
 }
 
-fn build_group_nodes(group_count:u32,group_node_count:u32)
+fn build_group_nodes(
+	group_count:u32,
+	group_node_count:u32,
+	boot_watch:Option<UnboundedSender<Vec<u8>>>,
+	node_watch:Option<UnboundedSender<Vec<u8>>>,
+)
 	// -> Box<(dyn IntoIterator<Item=impl Stream<Item=Event>>, dyn IntoIterator<Item=(PeerId,Arc<TestNetworkService>)>)>
-    -> Option<(Vec<impl Stream<Item=Event>>,Vec<(PeerId,Arc<TestNetworkService>)>)>
+    -> Option<(Vec<(Arc<TestNetworkService>,impl Stream<Item=Event>)>,Vec<(PeerId,Arc<TestNetworkService>)>)>
 {
 	let mut groups = vec![];
+	let pool = build_pool();
+	let b_watch = boot_watch.unwrap();
 	for g in 0..group_count {
-		let listen_addr = config::build_multiaddr![Ip4([192, 168, 1, 27]), Tcp(3400_u16 + g as u16)];
+		let watch = b_watch.clone();
+
+		let listen_addr = config::build_multiaddr![Ip4([192, 168, 1, 27]), Tcp(4000_u16 + g as u16)];
 		let (mut node1, events_stream1) = build_test_full_node(config::NetworkConfiguration {
 			notifications_protocols: vec![PROTOCOL_TEST],
 			listen_addresses: vec![listen_addr.clone()],
-			in_peers:16,
-			out_peers:16,
+			in_peers:8,
+			out_peers:8,
 			transport: config::TransportConfig::Normal {
 				enable_mdns:false,
 				allow_private_ipv4:true,
 				wasm_external_transport:None,
 			},
+			request_response_protocols:vec![],
 			.. config::NetworkConfiguration::new_local()
-		});
+		},pool.clone());
+		node1.set_group_role(GroupRoles::Relay);
+		// node1.set_watcher(Some(watch));
 		groups.push((node1,events_stream1,listen_addr));
 	}
 	let mut nodes = vec![];
 	let mut gx = 0_u16;
+	let n_watch = node_watch.unwrap();
 	for (node1,_,group_addr) in groups.iter() {
 		let local = &node1.local_peer_id;
-		let group_id = format!("shard{}",gx);
+		let group_id = format!("shard{}0",gx);
 		node1.join_group(group_id.clone()).unwrap();
-        gx +=1;
+		async_std::task::sleep(Duration::from_millis(20));
+
 		for x in 0..group_node_count {
+			let watch = n_watch.clone();
 			// let listen1_addr = config::build_multiaddr![Ip4([0, 0, 0, 0]), Tcp(0_u16)];
-			let listen1_addr = config::build_multiaddr![Ip4([192, 168, 1, 27]), Tcp(4000_u16 + (gx * 100) + x as u16)];
+			let listen1_addr = config::build_multiaddr![Ip4([192, 168, 1, 27]), Tcp(8000_u16 + (gx * 100) + x as u16)];
 			let (mut node2, _events_stream2) = build_test_full_node(config::NetworkConfiguration {
 				notifications_protocols: vec![PROTOCOL_TEST],
 				listen_addresses: vec![listen1_addr.clone()],
-				in_peers:16,
-				out_peers:16,
+				in_peers:8,
+				out_peers:8,
+				// boot_nodes:vec![config::MultiaddrWithPeerId {
+				// 		multiaddr: group_addr.clone(),
+				// 		peer_id: local.clone(),
+				// 	}
+				// ],
 				reserved_nodes: vec![config::MultiaddrWithPeerId {
 					multiaddr: group_addr.clone(),
 					peer_id: local.clone(),
@@ -197,12 +226,17 @@ fn build_group_nodes(group_count:u32,group_node_count:u32)
 					wasm_external_transport:None,
 				},
 				.. config::NetworkConfiguration::new_local()
-			});
-			node2.join_group(group_id.clone()).unwrap();
+			},pool.clone());
+			node2.set_group_role(GroupRoles::Shard);
+			async_std::task::sleep(Duration::from_millis(20));
+			let group_id = format!("shard{}{}",gx,x % 4);
+			node2.join_group(group_id).unwrap();
+			// node2.set_watcher(Some(watch));
 			nodes.push((local.clone(),node2));
 		}
+		gx +=1;
 	}
-    let groups = groups.into_iter().map(|(_,stream,_)|stream).collect::<Vec<_>>();
+    let groups = groups.into_iter().map(|(boot,stream,_)|(boot,stream)).collect::<Vec<_>>();
 
 	Some((groups,nodes))
 }
@@ -336,14 +370,14 @@ fn notifications_state_consistent() {
 #[test]
 fn lots_of_incoming_peers_works() {
 	let listen_addr = config::build_multiaddr![Memory(rand::random::<u64>())];
-
+    let pool = build_pool();
 	let (main_node, _) = build_test_full_node(config::NetworkConfiguration {
 		notifications_protocols: vec![PROTOCOL_NAME],
 		listen_addresses: vec![listen_addr.clone()],
 		in_peers: u32::max_value(),
 		transport: config::TransportConfig::MemoryOnly,
 		.. config::NetworkConfiguration::new_local()
-	});
+	},pool.clone());
 
 	let main_node_peer_id = main_node.local_peer_id().clone();
 
@@ -363,7 +397,7 @@ fn lots_of_incoming_peers_works() {
 			}],
 			transport: config::TransportConfig::MemoryOnly,
 			.. config::NetworkConfiguration::new_local()
-		});
+		},pool.clone());
 
 		background_tasks_to_wait.push(async_std::task::spawn(async move {
 			// Create a dummy timer that will "never" fire, and that will be overwritten when we
@@ -463,7 +497,7 @@ fn ensure_listen_addresses_consistent_with_transport_memory() {
 		listen_addresses: vec![listen_addr.clone()],
 		transport: config::TransportConfig::MemoryOnly,
 		.. config::NetworkConfiguration::new("test-node", "test-client", Default::default(), None)
-	});
+	},build_pool());
 }
 
 #[test]
@@ -474,7 +508,7 @@ fn ensure_listen_addresses_consistent_with_transport_not_memory() {
 	let _ = build_test_full_node(config::NetworkConfiguration {
 		listen_addresses: vec![listen_addr.clone()],
 		.. config::NetworkConfiguration::new("test-node", "test-client", Default::default(), None)
-	});
+	},build_pool());
 }
 
 #[test]
@@ -491,7 +525,7 @@ fn ensure_boot_node_addresses_consistent_with_transport_memory() {
 		transport: config::TransportConfig::MemoryOnly,
 		boot_nodes: vec![boot_node],
 		.. config::NetworkConfiguration::new("test-node", "test-client", Default::default(), None)
-	});
+	},build_pool());
 }
 
 #[test]
@@ -507,7 +541,7 @@ fn ensure_boot_node_addresses_consistent_with_transport_not_memory() {
 		listen_addresses: vec![listen_addr.clone()],
 		boot_nodes: vec![boot_node],
 		.. config::NetworkConfiguration::new("test-node", "test-client", Default::default(), None)
-	});
+	},build_pool());
 }
 
 #[test]
@@ -524,7 +558,7 @@ fn ensure_reserved_node_addresses_consistent_with_transport_memory() {
 		transport: config::TransportConfig::MemoryOnly,
 		reserved_nodes: vec![reserved_node],
 		.. config::NetworkConfiguration::new("test-node", "test-client", Default::default(), None)
-	});
+	},build_pool());
 }
 
 #[test]
@@ -540,7 +574,7 @@ fn ensure_reserved_node_addresses_consistent_with_transport_not_memory() {
 		listen_addresses: vec![listen_addr.clone()],
 		reserved_nodes: vec![reserved_node],
 		.. config::NetworkConfiguration::new("test-node", "test-client", Default::default(), None)
-	});
+	},build_pool());
 }
 
 #[test]
@@ -554,7 +588,7 @@ fn ensure_public_addresses_consistent_with_transport_memory() {
 		transport: config::TransportConfig::MemoryOnly,
 		public_addresses: vec![public_address],
 		.. config::NetworkConfiguration::new("test-node", "test-client", Default::default(), None)
-	});
+	},build_pool());
 }
 
 #[test]
@@ -562,65 +596,103 @@ fn ensure_public_addresses_consistent_with_transport_memory() {
 fn ensure_public_addresses_consistent_with_transport_not_memory() {
 	let listen_addr = config::build_multiaddr![Ip4([127, 0, 0, 1]), Tcp(0_u16)];
 	let public_address = config::build_multiaddr![Memory(rand::random::<u64>())];
-
+    let pool = futures::executor::ThreadPoolBuilder::new().create().expect("");
 	let _ = build_test_full_node(config::NetworkConfiguration {
 		listen_addresses: vec![listen_addr.clone()],
 		public_addresses: vec![public_address],
 		.. config::NetworkConfiguration::new("test-node", "test-client", Default::default(), None)
-	});
+	},pool);
 }
 
 #[test]
 fn group_tests() {
 	env_logger::init();
-
-	let ret = build_group_nodes(4,4);
+    let (tx,rx) = unbounded();
+	let ret = build_group_nodes(2,90,Some(tx.clone()),Some(tx.clone()));
 	let (mut events,nodes) = ret.unwrap();
-
+	let mut boots = vec![];
+	for (b,_) in events.iter() {
+		boots.push(b.clone());
+	}
 	async_std::task::spawn(async move {
 		loop {
 			//group event
 			let mut events = events.iter_mut();
-			for evt in events {
+			for (boot,evt) in events {
 				if let Some(e) = evt.next().await {
 					match e {
 						Event::NotificationsReceived { remote, messages } =>{
 							for (proto,data) in messages{
 								let data = data.to_vec();
-								log::debug!("{:?}------------------>>>>>>{:?}==>{}",remote,proto,String::from_utf8_lossy(&data[..]));
+								log::info!("{:?}------------------>>>>>>{:?}==>{}",remote,proto,hex::encode(&data[..]));
 							}
 						},
 						Event::Dht(e)=>{
 
 						},
 						_=> {
-                           log::warn!("=================={:?}",e);
+                           //log::warn!("=================={:?}",e);
 						}
 					}
 				}
+
 			}
 
 		}
 	});
 
 	async_std::task::block_on(async move {
+		let mut counter:usize = 0;
+		let mut rng = rand::thread_rng();
 		loop {
-			let mut nodes = nodes.iter();
-			async_std::task::sleep(Duration::from_millis(10000)).await;
-			for (g,n) in nodes {
-				let msg =
-				crate::protocol::message::Message::<substrate_test_runtime_client::runtime::Block>::Consensus(
-					crate::protocol::message::generic::ConsensusMessage {
-						protocol: [1,2,3,4],
-						data: "Hello".as_bytes().to_vec(),
-					}
-				);
-				let data = msg.encode();
-				//<RelayDataReq<B> as Encode>::encode(&dataRelayReq);
-				// let data = "Hello".to_string().into_bytes();
-				n.write_notification(g.clone(),PROTOCOL_TEST,data);
+			log::info!("-------------pub-----------------");
+			{
+				async_std::task::sleep(Duration::from_millis( 1 * 1000)).await;
+				let x = counter % nodes.len();
+				let (_,n) = &nodes[x];
+				let groups = n.local_groups.lock();
+
+				for tg in groups.iter(){
+
+					let mut nums=vec![0_u8;1024];
+                    rng.fill_bytes(&mut nums);
+					log::warn!("node pub....to:{}----{:?}",tg,n.local_peer_id.clone());
+					n.publish_message(tg.clone(),nums);
+				}
+
+
 			}
+			{
+				async_std::task::sleep(Duration::from_millis( 1 * 1000)).await;
+				let y = counter % boots.len();
+				let boot = &boots[y];
+				let groups = boot.local_groups.lock();
+				for tg in groups.iter(){
+					let mut nums=vec![0_u8;246];
+					rng.fill_bytes(&mut nums);
+					log::warn!("boot pub....to:{}----{:?}",tg,boot.local_peer_id.clone());
+					boot.publish_message(tg.clone(),nums);
+				}
+				counter = counter + 1;
+			}
+
+
+
 		}
 	});
+	//
+	// futures::future::poll_fn(move |cx|loop {
+    //     match rx.poll_next(cx) {
+	// 		Poll::Ready(None) => panic!(""),
+	// 		Poll::Ready(Some(x)) => {
+	// 			let hx = hex::encode(x);
+	// 			log::info!("hashed:{}",hx);
+	// 		}
+	// 		Poll::Pending => {
+	//
+	// 		}
+	// 	}
+	//
+	// });
 
 }

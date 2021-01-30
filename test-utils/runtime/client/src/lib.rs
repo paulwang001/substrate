@@ -229,6 +229,8 @@ pub trait TestClientBuilderExt<B>: Sized {
 
 	/// Build the test client and longest chain selector.
 	fn build_with_longest_chain(self) -> (Client<B>, sc_consensus::LongestChain<B, substrate_test_runtime::Block>);
+	fn build_pool_longest_chain(self,pool:futures::executor::ThreadPool) -> (Client<B>, sc_consensus::LongestChain<B, substrate_test_runtime::Block>);
+
 
 	/// Build the test client and the backend.
 	fn build_with_backend(self) -> (Client<B>, Arc<B>);
@@ -249,6 +251,10 @@ impl<B> TestClientBuilderExt<B> for TestClientBuilder<
 
 	fn build_with_longest_chain(self) -> (Client<B>, sc_consensus::LongestChain<B, substrate_test_runtime::Block>) {
 		self.build_with_native_executor(None)
+	}
+
+	fn build_pool_longest_chain(self,pool:futures::executor::ThreadPool) -> (Client<B>, sc_consensus::LongestChain<B, substrate_test_runtime::Block>) {
+		self.build_with_pool_native_executor(pool,None)
 	}
 
 	fn build_with_backend(self) -> (Client<B>, Arc<B>) {

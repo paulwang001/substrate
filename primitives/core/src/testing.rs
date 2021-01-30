@@ -141,6 +141,10 @@ impl TaskExecutor {
 		let mut builder = futures::executor::ThreadPoolBuilder::new();
 		Self(builder.pool_size(8).create().expect("Failed to create thread pool"))
 	}
+	pub fn new_with_pool(pool:futures::executor::ThreadPool) -> Self {
+		Self(pool)
+	}
+
 }
 
 #[cfg(feature = "std")]

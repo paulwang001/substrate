@@ -19,8 +19,10 @@ fn pop(barry: &[u8]) -> &[u8; 4] {
 impl BucketTable {
     fn bucket_index(&self,target:&PeerId)-> usize{
         //ignore first two bytes which is format and length description
-        let a = u32::from_be_bytes(*pop(&self.local_key.as_bytes()[2..6]));
-        let b = u32::from_be_bytes(*pop(&target.as_bytes()[2..6]));
+        let local = self.local_key.as_bytes();
+        let tgt = target.as_bytes();
+        let a = u32::from_be_bytes(*pop(&local[local.len()-4..]));
+        let b = u32::from_be_bytes(*pop(&tgt[tgt.len()-4..]));
 
         let bucketDistance = a ^ b ;
        
@@ -39,7 +41,8 @@ impl BucketTable {
         table
     }
     pub fn PeerConnected(&mut self,peer:&PeerId) {
-         let bucketIndex =  self.bucket_index(peer);
+        let bucketIndex =  self.bucket_index(peer);
+        // log::warn!("bucket peer:{} -->{:?}",bucketIndex,peer.clone());
         if !self.buckets[bucketIndex].contains(peer) {
             self.buckets[bucketIndex].insert(peer.clone());
             self.calc_saturation();
@@ -76,7 +79,7 @@ impl BucketTable {
         self.saturation = temp_sat;
     }
 
-    pub fn get_closet_peers(&mut self,target:&PeerId,amax_peers:usize)->Vec<PeerId> {
+    pub fn get_closet_peers(&self,target:&PeerId,amax_peers:usize)->Vec<PeerId> {
         let mut max_peers = amax_peers;
         if max_peers == 0 {
             max_peers = ALPHA;
@@ -114,6 +117,77 @@ impl BucketTable {
         }
         result
     }
+
+
+    pub fn find_closet_peers(&self,target:&PeerId,amax_peers:usize,includes:Option<&Vec<PeerId>>,excludes:Option<&Vec<PeerId>>)->Vec<PeerId> {
+        let mut max_peers = amax_peers;
+        if max_peers == 0 {
+            max_peers = ALPHA;
+        }
+        let mut bucketIndex = self.bucket_index(target);
+        let mut result = vec![];
+        let mut totalCount = 0;
+        if self.buckets[bucketIndex].contains(target){
+            result.push(target.clone());
+            totalCount = 1;
+        }
+        if bucketIndex <= self.saturation as usize {
+
+            for (_,item) in self.buckets[bucketIndex].iter().enumerate() {
+                if let Some(ins) = includes {
+                    if !ins.contains(&item) {
+                        continue;
+                    }
+                }
+                if let Some(ex) = excludes {
+                    if ex.contains(&item) {
+                        continue;
+                    }
+                }
+                if item != target{
+                    result.push(item.clone());
+                    totalCount += 1;
+                    if totalCount >= max_peers {
+                        break;
+                    }
+                }
+            }
+        }else{
+            for index in  (self.saturation+1) as usize..NUM_BUCKETS-1 {
+                for (_,item) in self.buckets[index].iter().enumerate() {
+                    if let Some(ins) = includes {
+                        if !ins.contains(&item) {
+                            continue;
+                        }
+                    }
+                    if let Some(ex) = excludes {
+                        if ex.contains(&item) {
+                            continue;
+                        }
+                    }
+                    if item != target{
+                        result.push(item.clone());
+                        totalCount += 1;
+                        if totalCount >= max_peers {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    pub fn all_peers(&self)->Vec<PeerId> {
+        let mut result = vec![];
+        for index in  0..NUM_BUCKETS {
+            for (_,item) in self.buckets[index].iter().enumerate() {
+                result.push(item.clone());
+            }
+        }
+        result
+    }
+
     pub fn get_saturation(&self)->u8{
         self.saturation
     }

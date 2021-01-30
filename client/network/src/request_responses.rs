@@ -217,11 +217,14 @@ impl RequestResponsesBehaviour {
 	{
 		if let Some((protocol, _)) = self.protocols.get_mut(protocol) {
 			if protocol.is_connected(target) {
+				log::trace!("send_request to :{:?}",target);
 				Ok(protocol.send_request(target, request))
 			} else {
+				log::warn!("SendRequestError::NotConnected");
 				Err(SendRequestError::NotConnected)
 			}
 		} else {
+			log::warn!("SendRequestError::UnknownProtocol");
 			Err(SendRequestError::UnknownProtocol)
 		}
 	}
@@ -707,9 +710,9 @@ mod tests {
 	fn basic_request_response_works() {
 		let protocol_name = "/test/req-resp/1";
 		let mut pool = LocalPool::new();
-
+		env_logger::init();
 		// Build swarms whose behaviour is `RequestResponsesBehaviour`.
-		let mut swarms = (0..2)
+		let mut swarms = (0..3)
 			.map(|_| {
 				let keypair = Keypair::generate_ed25519();
 
@@ -737,6 +740,7 @@ mod tests {
 					pool.spawner().spawn_obj(async move {
 						while let Some(rq) = rx.next().await {
 							assert_eq!(rq.payload, b"this is a request");
+							log::warn!("payload:{}",hex::encode(rq.payload));
 							let _ = rq.pending_response.send(b"this is a response".to_vec());
 						}
 					}.boxed().into()).unwrap();
@@ -759,6 +763,10 @@ mod tests {
 			Swarm::dial_addr(&mut swarms[0].0, dial_addr).unwrap();
 		}
 
+		{
+			let dial_addr = swarms[0].1.clone();
+			Swarm::dial_addr(&mut swarms[2].0, dial_addr).unwrap();
+		}
 		// Running `swarm[0]` in the background.
 		pool.spawner().spawn_obj({
 			let (mut swarm, _) = swarms.remove(0);
@@ -768,6 +776,41 @@ mod tests {
 						SwarmEvent::Behaviour(super::Event::InboundRequest { result, .. }) => {
 							result.unwrap();
 						},
+						_ => {}
+					}
+				}
+			}.boxed().into()
+		}).unwrap();
+
+		// Running `swarm[1]` in the background.
+		pool.spawner().spawn_obj({
+			let (mut swarm, _) = swarms.remove(0);
+			async move {
+				let mut sent_request_id = None;
+				loop {
+					match swarm.next_event().await {
+						SwarmEvent::Behaviour(super::Event::InboundRequest { result, .. }) => {
+							result.unwrap();
+						},
+						SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+							let id = swarm.send_request(
+								&peer_id,
+								protocol_name,
+								b"this is a request".to_vec()
+							).unwrap();
+							assert!(sent_request_id.is_none());
+							sent_request_id = Some(id);
+						},
+						SwarmEvent::Behaviour(super::Event::RequestFinished {
+												  request_id,
+												  result,
+											  }) => {
+							assert_eq!(Some(request_id), sent_request_id);
+							let result = result.unwrap();
+							assert_eq!(result, b"this is a response");
+							log::warn!("2-->{}",hex::encode(result));
+							// break;
+						}
 						_ => {}
 					}
 				}
@@ -797,7 +840,8 @@ mod tests {
 						assert_eq!(Some(request_id), sent_request_id);
 						let result = result.unwrap();
 						assert_eq!(result, b"this is a response");
-						break;
+						log::warn!("3-->{}",hex::encode(result));
+						// break;
 					}
 					_ => {}
 				}

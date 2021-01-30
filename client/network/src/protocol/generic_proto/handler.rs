@@ -645,7 +645,7 @@ impl ProtocolsHandler for NotifsHandler {
 						}),
 					};
 
-					debug_assert!(pending_handshake.is_some());
+					// debug_assert!(pending_handshake.is_some());
 					let pending_handshake = pending_handshake.take().unwrap_or_default();
 
 					let out_substreams = out_substreams

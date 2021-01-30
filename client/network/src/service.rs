@@ -49,6 +49,7 @@ use crate::{
 		event::Event,
 		sync::SyncState,
 		GroupProto,
+		transpp::buckets::BucketTable,
 	},
 	transport, ReputationChange,
 };
@@ -79,7 +80,7 @@ use metrics::{Metrics, MetricSources, Histogram, HistogramVec};
 use parking_lot::Mutex;
 use sc_peerset::{PeersetHandle, Peerset};
 use sp_consensus::import_queue::{BlockImportError, BlockImportResult, ImportQueue, Link};
-use sp_runtime::traits::{Block as BlockT, NumberFor};
+use sp_runtime::traits::{Block as BlockT, NumberFor, Hash,HashFor};
 use sp_utils::mpsc::{tracing_unbounded, TracingUnboundedReceiver, TracingUnboundedSender};
 use std::{
 	borrow::Cow,
@@ -96,9 +97,15 @@ use std::{
 	task::Poll,
 };
 use wasm_timer::Instant;
-
+use lru::LruCache;
+use codec::{Encode,Decode};
+use codec::EncodeAsRef;
 pub use behaviour::{ResponseFailure, InboundFailure, RequestFailure, OutboundFailure};
 use smallvec::alloc::collections::VecDeque;
+use futures::channel::mpsc::UnboundedSender;
+use crate::config::{RequestResponseConfig, IncomingRequest};
+use futures::channel::oneshot::Canceled;
+use rand::Rng;
 
 mod metrics;
 mod out_events;
@@ -106,6 +113,29 @@ mod out_events;
 mod tests;
 
 const BANNED_THRESHOLD: i32 = 82 * (i32::min_value() / 100);
+
+const GROUP_MESSAGE_PROTOCOL:&'static str = "/message/1";
+
+#[derive(Debug,Encode,Decode,Clone)]
+pub struct GroupMessage<B:BlockT+ 'static> {
+   sender:Vec<u8>,
+   hash:B::Hash,
+   data:Option<Vec<u8>>,
+   group_id:Vec<u8>,
+   ttl:Option<u8>,
+}
+
+impl<B:BlockT+ 'static> GroupMessage<B> {
+	pub fn get_group_id(&self) ->String {
+		String::from_utf8(self.group_id.clone()).unwrap()
+	}
+}
+
+#[derive(PartialEq,Debug,Clone)]
+pub enum GroupRoles {
+	Relay,
+	Shard,
+}
 
 /// Substrate network service. Handles network IO and manages connectivity.
 pub struct NetworkService<B: BlockT + 'static, H: ExHashT> {
@@ -131,9 +161,14 @@ pub struct NetworkService<B: BlockT + 'static, H: ExHashT> {
 	/// notifications-related metrics.
 	notifications_sizes_metric: Option<HistogramVec>,
 	local_groups: Arc<Mutex<HashSet<String>>>,
+	known_notifi_message:Arc<Mutex<LruCache<Vec<u8>,Vec<PeerId>>>>,
 	joining:Arc<Mutex<HashMap<record::Key,String>>>,
-	group_members:Arc<Mutex<HashMap<String,Vec<PeerId>>>>,
+	group_members:Arc<Mutex<HashMap<String,Vec<(PeerId,String)>>>>,
 	looking_members:Arc<Mutex<HashMap<record::Key,(String,Instant)>>>,
+	role:Arc<Mutex<GroupRoles>>,
+	buckets:Arc<Mutex<HashMap<String,BucketTable>>>,
+	watch:Option<UnboundedSender<Vec<u8>>>,
+	pending_grouping:Arc<Mutex<VecDeque<(futures::channel::oneshot::Receiver<Result<Vec<u8>,RequestFailure>>,PeerId,String)>>>,
 	/// Marker to pin the `H` generic. Serves no purpose except to not break backwards
 	/// compatibility.
 	_marker: PhantomData<H>,
@@ -289,6 +324,7 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 			params.metrics_registry.as_ref(),
 			boot_node_ids.clone(),
 		)?;
+		let (tx_qry,message_inbound_queue) = futures::channel::mpsc::channel::<IncomingRequest>(1024);
 		// Build the swarm.
 		let (mut swarm, bandwidth): (Swarm<B, H>, _) = {
 			let user_agent = format!(
@@ -345,6 +381,14 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 			// 	group_psm,
 			// 	params.protocol_id.clone(),
 			// );
+			let mut rr_protocols = params.network_config.request_response_protocols.iter().map(|cfg|cfg.clone()).collect::<Vec<_>>();
+			rr_protocols.push(RequestResponseConfig{
+				name: "/group/message/1".into(),
+				max_request_size: 1024,
+				max_response_size: 1024 * 1024 * 4,
+				request_timeout: core::time::Duration::from_secs(10),
+				inbound_queue: Some(tx_qry)
+			});
 			let mut behaviour = {
 				let result = Behaviour::new(
 					protocol,
@@ -354,8 +398,7 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 					block_requests,
 					light_client_handler,
 					discovery_config,
-					params.network_config.request_response_protocols,
-					// group,
+					rr_protocols,
 				);
 
 				match result {
@@ -375,7 +418,8 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 			// 	group_notifi_protocol
 			// });
 			//
-			// behaviour.register_notifications_protocol("/group/1");
+
+			behaviour.register_notifications_protocol(GROUP_MESSAGE_PROTOCOL);
 
 			for protocol in &params.network_config.notifications_protocols {
 				behaviour.register_notifications_protocol(protocol.clone());
@@ -443,15 +487,19 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 			peerset: peerset_handle,
 			local_peer_id,
 			to_worker,
-			group_members:Arc::new(Mutex::new(HashMap::<String,Vec<PeerId>>::new())),
+			group_members:Arc::new(Mutex::new(HashMap::<String,Vec<(PeerId,String)>>::new())),
 			local_groups:Arc::new(Mutex::new(HashSet::<String>::new())),
+			known_notifi_message: Arc::new(Mutex::new(LruCache::new(1024))),
 			joining:Arc::new(Mutex::new(HashMap::<record::Key,String>::new())),
 			looking_members: Arc::new(Default::default()),
+			buckets:Arc::new(Mutex::new(HashMap::<String,BucketTable>::new())),
+			role: Arc::new(Mutex::new(GroupRoles::Relay)),
 			peers_notifications_sinks: peers_notifications_sinks.clone(),
 			notifications_sizes_metric:
 				metrics.as_ref().map(|metrics| metrics.notifications_sizes.clone()),
+			watch: None,
+			pending_grouping: Arc::new(Default::default()),
 			_marker: PhantomData,
-
 		});
 
 		Ok(NetworkWorker {
@@ -469,7 +517,13 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 			boot_node_ids,
 			pending_requests: HashMap::with_capacity(128),
 			pending_get_group: Default::default(),
-			pending_put_group: Default::default()
+			pending_put_group: Default::default(),
+			// pending_put_message: Default::default(),
+			know_hashed_message: LruCache::new(20000),
+			pending_get_message_content: Default::default(),
+			pending_rx_message_content: Default::default(),
+			message_inbound_queue,
+			know_peer_group: Default::default()
 		})
 	}
 
@@ -1102,97 +1156,110 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkService<B, H> {
 			.collect::<Result<Vec<(PeerId, Multiaddr)>, String>>()
 	}
 
+	pub fn set_group_role(&self,role:GroupRoles) {
+		let mut r = self.role.lock();
+		*r = role;
+	}
+
 	pub fn join_group(&self,group_id:String) ->Result<(),String> {
 		let mut local_groups = self.local_groups.lock();
         if local_groups.contains(&group_id) {
 			trace!("joined:{}",group_id);
 			return Ok(());
 		}
-
-		let mut groups = local_groups.iter().fold(String::new(),|mut groups,group|{
-			if groups.is_empty() == false {
-				groups.push_str(",");
-			}
-			groups.push_str(&group[..]);
-			groups
-		});
-		if groups.is_empty() == false {
-			groups.push_str(",");
-		}
-		groups.push_str(&group_id[..]);
 		local_groups.insert(group_id.clone());
-		let key = self.local_peer_id.clone();
-		let mut key = key.into_bytes();
-		key.append(&mut vec![1_u8;8]);
-		let key = record::Key::from(key);
-		let msg = ServiceToWorkerMsg::<B,H>::PutValue(key.clone(),groups.as_bytes().to_vec());
+
+		let mut buckets = self.buckets.lock();
+		buckets.insert(group_id.clone(),BucketTable::new(self.local_peer_id.clone()));
+
+		let key = record::Key::from(group_id.clone().into_bytes());
+
+		let msg = ServiceToWorkerMsg::<B,H>::PutValue(key.clone(),self.local_peer_id.clone().into_bytes());
 		self.to_worker.unbounded_send(msg).expect("");
-		let mut joining = self.joining.lock();
-		joining.insert(key,group_id);
-		// let get_msg = ServiceToWorkerMsg::<B,H>::GetValue(key);
-		// self.to_worker
-		// 	.unbounded_send(ServiceToWorkerMsg::AnnounceGroup(self.local_peer_id.clone(),group_id.into_bytes()));
-		log::debug!("joining...");
+
 		Ok(())
+	}
+
+	pub fn leave_group(&self,group_id:String) {
+
+		let mut buckets = self.buckets.lock();
+		buckets.remove(&group_id);
+
+		let key = record::Key::from(group_id.clone().into_bytes());
+
+		let msg = ServiceToWorkerMsg::<B,H>::PutValue(key,vec![]);
+		self.to_worker.unbounded_send(msg).expect("");
+
+		let mut group_members = self.group_members.lock();
+		let members = group_members.remove(&group_id);
+		if let Some(members) = members {
+			for (p,_) in members {
+				if group_members.iter().find(|(_,mm)| mm.iter().find(|(pp,_)| pp == &p ).is_some()).is_none() {
+                    self.disconnect_peer(p);
+				}
+			}
+		}
+		let mut local_groups = self.local_groups.lock();
+		local_groups.remove(&group_id);
 	}
 
 	///get the peer group on ConnectionEstablished
 	pub fn get_peer_group(&self,peer_id:PeerId,direction:String) {
-		let mut key = peer_id.into_bytes();
-		key.append(&mut vec![1_u8;8]);
-		let key = record::Key::from(key);
-		let get_msg = ServiceToWorkerMsg::<B,H>::GetValue(key.clone());
-		let mut looking_members = self.looking_members.lock();
-		looking_members.insert(key,(direction,Instant::now()));
-		self.to_worker.unbounded_send(get_msg).expect("");
-		log::debug!("peer group...");
+		let (tx,rx) = oneshot::channel::<Result<Vec<u8>,RequestFailure>>();
+		let group_req = ServiceToWorkerMsg::<B,H>::Request {
+			target: peer_id.clone(),
+			protocol: "/group/query/1".into(),
+			request: vec![1_u8;8],
+			pending_response: tx,
+		};
+		log::info!("get the peer group on ConnectionEstablished--------------------{}",&direction);
+		self.pending_grouping.lock().push_back((rx,peer_id,direction));
+		self.to_worker.unbounded_send(group_req).expect("----------------------");
+
+
+		// let rsp =
+		// async_std::task::block_on(async move{
+		// 	//self.request(peer_id.clone(),"/group/query/1",vec![1_u8;8]).await
+		// 	rx.await.expect("")
+		// });
+        // log::info!("group query is ok:{}",rsp.is_ok());
+		// let mut key = peer_id.into_bytes();
+		// key.append(&mut vec![1_u8;8]);
+		// let key = record::Key::from(key);
+		// if let Ok(groups) = rsp {
+		// 	log::info!("peer group by req...");
+		// 	self.on_group_member(key,Some(String::from_utf8(groups).expect("")));
+		// }
+		// else{
+		// 	let get_msg = ServiceToWorkerMsg::<B,H>::GetValue(key.clone());
+		// 	let mut looking_members = self.looking_members.lock();
+		// 	looking_members.insert(key,(direction,Instant::now()));
+		// 	self.to_worker.unbounded_send(get_msg).expect("");
+		// 	log::info!("peer group...");
+		// }
+
+
 	}
 
 	/// query group of peer
-	pub fn on_group_member(&self,key:record::Key,group_ids:Option<String>){
-		if group_ids.is_some() {
+	pub fn on_group_member(&self,group_id:String,peer_id:PeerId){
+		{
 			let mut group_members = self.group_members.lock();
-			let groups = group_ids.unwrap_or("".to_string());
-			let local_groups = self.local_groups.lock();
-
-			let mut looking_members = self.looking_members.lock();
-			let (dir,_created) = looking_members.remove(key.as_ref()).unwrap_or((String::new(),Instant::now()));
-			let mut in_group_num = 1;
-			let k = key.to_vec();
-			let (peer_id,_) = k.split_at(k.len()-8);
-			let peer_id = PeerId::from_bytes(peer_id.to_vec()).expect("");
-			groups.split(",").for_each(|g|{
-
-                log::debug!("group is {} for peer {:?}",&groups,&peer_id);
-				if local_groups.contains(g) {
-					let members = group_members.entry(g.to_string()).or_insert(vec![]);
-					members.push(peer_id.clone());
-					if "out" == &dir[..] {
-						&self.peerset.add_to_priority_group(g.to_string(),peer_id.clone());
-					}
-					in_group_num +=1 ;
-				}
-				else{
-					//try disconnect peer_id of other group peer
-					if "out" == &dir[..] {
-						&self.peerset.remove_from_priority_group(g.to_string(), peer_id.clone());
-					}
-				}
-			});
-			if in_group_num == 1 {
-				&self.peerset.report_peer(peer_id,ReputationChange::new(-(1<<2), "other group"));
-			}
-			else{
-				&self.peerset.report_peer(peer_id,ReputationChange::new(1 << in_group_num, "other group"));
+			let mut members = group_members.entry(group_id.clone()).or_insert(Vec::with_capacity(1024));
+			if members.iter().find(|(p,_)| p == &peer_id).is_none() {
+				members.push((peer_id.clone(),String::new()));
 			}
 		}
+		// log::info!("on_group_member:{}-->p:{:?}",&group_id,peer_id);
+		&self.peerset.add_to_priority_group(group_id,peer_id.clone());
+		&self.peerset.report_peer(peer_id,ReputationChange::new(10, "our group"));
 
 	}
 
 	pub fn on_local_join(&self,key:record::Key) {
 		let mut joining = self.joining.lock();
 		if let Some(group_id) = joining.remove(key.as_ref()) {
-			log::debug!("{:?} joined to group {}.",self.local_peer_id,&group_id);
+			log::info!("{:?} joined to group {}.",self.local_peer_id,&group_id);
 			let mut local_groups = self.local_groups.lock();
 			local_groups.insert(group_id);
 
@@ -1208,6 +1275,62 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkService<B, H> {
 		groups
 	}
 
+	pub fn set_watcher(&mut self,watch:Option<UnboundedSender<Vec<u8>>>) {
+		self.watch = watch;
+	}
+
+	pub fn publish_message(&self,group_id:String,data:Vec<u8>) {
+        let hash = HashFor::<B>::hash(data.as_slice());
+		let msg = GroupMessage {
+			sender: self.local_peer_id.as_bytes().to_vec(),
+			hash,
+			data:Some(data),
+			group_id: group_id.into_bytes(),
+			ttl:Some(6),
+		};
+        if let Err(e) = self.to_worker.unbounded_send(ServiceToWorkerMsg::Message(msg)){
+			log::warn!("{:?}",e);
+		}
+	}
+
+	pub fn on_notifi_message(&self,msg:GroupMessage<B>){
+
+		let group_id = msg.get_group_id();
+		let hash = msg.hash.as_ref().to_vec();
+		let mut buckets = self.buckets.lock();
+
+
+		if let Some(bucket) = buckets.get(&group_id) {
+
+			let mut targets = vec![];
+			{
+				let target = PeerId::random();
+				let group_members = self.group_members.lock();
+				if let Some(members) = group_members.get(&group_id) {
+					let mut known = self.known_notifi_message.lock();
+					let hash_know = known.get(&hash);
+					let members = members.iter().map(|(p,_)| p.clone()).collect::<Vec<_>>();
+					let mut founds = bucket.find_closet_peers(&target,5,Some(&members),hash_know);
+					targets.append(&mut founds);
+				}
+				if targets.is_empty() {
+					log::debug!("notifi target is empty,get closet peers");
+					//targets.append(&mut bucket.get_closet_peers(&target,1));
+				}
+				// bucket.all_peers()
+			};
+			let notif = msg.encode();
+			log::info!("notifi group {} message to targets--->{}",group_id,targets.len());
+			for tt in targets {
+				self.write_notification(tt.clone(),GROUP_MESSAGE_PROTOCOL.clone().into(),notif.clone());
+			}
+
+		}
+		else{
+			log::warn!("------------->message from other group:{},local_groups:{:?}!!!",group_id,self.local_groups)
+		}
+
+	}
 
 }
 
@@ -1351,7 +1474,7 @@ enum ServiceToWorkerMsg<B: BlockT, H: ExHashT> {
 	},
 	DisconnectPeer(PeerId),
 	NewBestBlockImported(B::Hash, NumberFor<B>),
-	// AnnounceGroup(PeerId,Vec<u8>),
+	Message(GroupMessage<B>),
 }
 
 /// Main network worker. Must be polled in order for the network to advance.
@@ -1391,9 +1514,14 @@ pub struct NetworkWorker<B: BlockT + 'static, H: ExHashT> {
 	/// For each peer and protocol combination, an object that allows sending notifications to
 	/// that peer. Shared with the [`NetworkService`].
 	peers_notifications_sinks: Arc<Mutex<HashMap<(PeerId, Cow<'static, str>), NotificationsSink>>>,
-
+    know_peer_group:HashMap<PeerId,Vec<u8>>,
 	pending_get_group:VecDeque<(record::Key,Instant)>,
-	pending_put_group:VecDeque<(record::Key,Vec<u8>,Instant)>,
+	pending_put_group:VecDeque<(record::Key,Instant)>,
+	// pending_put_message:VecDeque<(record::Key,GroupMessage<B>,Instant)>,
+	know_hashed_message:LruCache<Vec<u8>, Vec<u8>>,
+	pending_get_message_content:VecDeque<(GroupMessage<B>,Instant)>,
+	pending_rx_message_content:VecDeque<(GroupMessage<B>,oneshot::Receiver<Result<Vec<u8>,RequestFailure>>)>,
+	message_inbound_queue:futures::channel::mpsc::Receiver<IncomingRequest>,
 }
 
 impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
@@ -1419,7 +1547,26 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 				}
 			}
 		}
+		while let Poll::Ready(Some(incoming)) = this.message_inbound_queue.poll_next_unpin(cx) {
+			let remote = &incoming.peer;
+			log::debug!("sending local content to:{:?}",&remote);
+			let mut hash = incoming.payload;
+			if let Some(cnt) = this.know_hashed_message.peek(&mut hash){
+                if let Err(e) = incoming.pending_response.send(cnt.clone()){
+					log::warn!("{:?}",e);
+				}
+				else{
+                   let mut known_notifi_message = this.service.known_notifi_message.lock();
+					if let Some(known_peers) = known_notifi_message.peek_mut(&hash){
+						known_peers.push(remote.clone());
+					}
+					else{
+						known_notifi_message.put(hash,vec![remote.clone()]);
+					}
+				}
+			}
 
+		}
 		// At the time of writing of this comment, due to a high volume of messages, the network
 		// worker sometimes takes a long time to process the loop below. When that happens, the
 		// rest of the polling is frozen. In order to avoid negative side-effects caused by this
@@ -1455,12 +1602,14 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 				ServiceToWorkerMsg::GetValue(key) =>
 					this.network_service.get_value(&key),
 				ServiceToWorkerMsg::PutValue(key, value) =>{
-					let k = key.to_vec();
-					let (_peer_id,proto) = k.split_at(k.len()-8);
-					if proto == &[1_u8; 8] {
-						this.pending_put_group.push_back((key.clone(),value.clone(),Instant::now()));
+					if value.is_empty() {
+						this.pending_put_group.retain(|(k,_)| k != &key);
+						this.pending_get_group.retain(|(k,_)| k != &key);
 					}
-					this.network_service.put_value(key, value);
+					else{
+						this.network_service.put_value(key, value);
+					}
+
 				},
 				ServiceToWorkerMsg::AddKnownAddress(peer_id, addr) =>
 					this.network_service.add_known_address(peer_id, addr),
@@ -1478,6 +1627,7 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 									.with_label_values(&[&protocol])
 									.inc();
 							}
+							log::trace!("pending_request:{:?}",request_id);
 							this.pending_requests.insert(
 								request_id,
 								(pending_response, Instant::now(), protocol.to_string())
@@ -1497,6 +1647,31 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 					this.network_service.user_protocol_mut().disconnect_peer(&who),
 				ServiceToWorkerMsg::NewBestBlockImported(hash, number) =>
 					this.network_service.user_protocol_mut().new_best_block_imported(hash, number),
+				ServiceToWorkerMsg::Message(msg) =>{
+					if let Some(cnt) = &msg.data {
+						if cnt.len() < 256 {
+							let hash = &msg.hash.as_ref().to_vec();
+							log::info!("publish....small content:{}", hex::encode(&hash));
+							this.know_hashed_message.put(hash.clone(),cnt.clone());
+							this.service.on_notifi_message(msg);
+							break;
+						}
+					}
+					let GroupMessage {
+						sender, hash, data, group_id, ttl
+					} = msg;
+					if let Some(cnt) = data {
+						this.know_hashed_message.put(hash.as_ref().to_vec(),cnt.clone());
+					}
+					this.service.on_notifi_message(GroupMessage {
+						sender,
+						hash,
+						data:None,
+						group_id,
+						ttl
+					});
+
+				},
 			}
 		}
 
@@ -1510,23 +1685,107 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 				break;
 			}
 
-			if let Some((pending_key,timer)) = this.pending_get_group.pop_front() {
-				if timer.elapsed().as_secs() > 10 {
-					log::warn!("Retrying get peer group...");
+			{
+				if let Some((mut msg,mut rx)) = this.pending_rx_message_content.pop_front() {
+					match rx.poll_unpin(cx) {
+						Poll::Ready(Ok(rsp)) => {
+							match rsp {
+								Ok(cnt) =>{
+									log::debug!("group message content has be requested");
+									let message = <GroupMessage::<B> as Encode>::encode(&msg);
+									let message = bytes::Bytes::from(message);
+
+									let GroupMessage {
+										sender, hash, data, group_id, ttl
+									} = msg;
+									let remote = PeerId::from_bytes(sender.clone()).unwrap();
+									this.event_streams.send(Event::NotificationsReceived {
+										remote,
+										messages:vec![(GROUP_MESSAGE_PROTOCOL.into(),message)],
+									});
+									let sender = this.service.local_peer_id.clone().into_bytes();
+									let data = data.unwrap_or(vec![]);
+									this.know_hashed_message.put(hash.as_ref().to_vec(),data);
+									log::debug!("large group message forward,ttl:{:?}",&ttl);
+									let ttl = ttl.unwrap_or(1);
+									this.service.clone().on_notifi_message(GroupMessage {
+										sender,
+										hash,
+										data: None,
+										group_id,
+										ttl:Some(ttl.max(1) -1)
+									});
+								},
+								Err(e)=>{
+									log::warn!("req failed!{:?}",e);
+								}
+							}
+
+						},
+						Poll::Ready(Err(e)) => {
+                            log::warn!("req for grouping has be canceled,{:?}",e);
+						},
+						Poll::Pending =>{
+							this.pending_rx_message_content.push_back((msg,rx));
+						}
+
+					}
+				}
+			}
+
+
+			// timer for query peers of local groups
+			if let Some((pending_key,mut timer)) = this.pending_get_group.pop_front() {
+				if timer.elapsed().as_secs() > 30 {
+					log::debug!("get group peers...");
 					this.network_service.get_value(&pending_key);
+					timer = Instant::now();
 				}
 				else{
 					this.pending_get_group.push_back((pending_key,timer));
 				}
 			}
 
-			if let Some((pending_key,data,timer)) = this.pending_put_group.pop_front() {
-				if timer.elapsed().as_secs() > 10 {
-					log::debug!("Retrying put peer group...");
-					this.network_service.put_value(pending_key.clone(),data.clone());
+			//timer for put local groups
+			if let Some((pending_key,mut timer)) = this.pending_put_group.pop_front() {
+				if timer.elapsed().as_secs() > 60 {
+					timer = Instant::now();
+					this.network_service.put_value(pending_key.clone(),this.service.local_peer_id.clone().into_bytes());
 				}
 				else{
-					this.pending_put_group.push_back((pending_key,data,timer));
+					this.pending_put_group.push_back((pending_key,timer));
+				}
+			}
+
+			// if let Some((pending_key,data,mut timer)) = this.pending_put_message.pop_front() {
+			// 	if timer.elapsed().as_secs() > 10 {
+			// 		log::info!("Retrying request ");
+			// 		timer = Instant::now();
+			// 	}
+			// 	this.pending_put_message.push_back((pending_key,data,timer));
+			// }
+
+			if let Some((msg,mut timer)) = this.pending_get_message_content.pop_front() {
+				if timer.elapsed().as_secs() > 10 {
+					if timer.elapsed().as_secs() < 20 {
+						log::warn!("Retrying request ");
+					}
+					let target = &msg.sender;
+					let target = PeerId::from_bytes(target.clone()).unwrap();
+					let request = (&msg.hash.as_ref()).to_vec();
+					let (tx,rx) = oneshot::channel::<Result<Vec<u8>,RequestFailure>>();
+					this.pending_rx_message_content.push_back((msg,rx));
+					let content_req = ServiceToWorkerMsg::<B,H>::Request {
+						target,
+						protocol: "/group/message/1".into(),
+						request,
+						pending_response: tx,
+					};
+
+					this.service.to_worker.unbounded_send(content_req).unwrap();
+				}
+				else{
+					this.pending_get_message_content.push_back((msg,timer));
 				}
 			}
 
@@ -1637,6 +1896,27 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 						metrics.notifications_streams_opened_total
 							.with_label_values(&[&protocol]).inc();
 					}
+
+					if protocol.as_ref() == GROUP_MESSAGE_PROTOCOL {
+						// log::info!("NotificationStreamOpened:{},peer:{:?}",protocol.as_ref(),remote.clone());
+						let mut buckets = this.service.buckets.lock();
+						buckets.iter_mut().for_each(|(_g,tb)|{
+							tb.PeerConnected(&remote);
+						});
+						// let group_members = this.service.group_members.lock();
+						// group_members.iter().for_each(|(g,members)| {
+						// 	members.iter().for_each(|(p,_)|{
+						// 		if p == &remote {
+						// 			if let Some(tb) = buckets.get_mut(g){
+						// 				tb.PeerConnected(&remote);
+						// 			}
+						// 			else{
+						// 			   	log::info!("no buckets for group {}",g);
+						// 			}
+						// 		}
+						// 	});
+						// });
+					}
 					{
 						let mut peers_notifications_sinks = this.peers_notifications_sinks.lock();
 						peers_notifications_sinks.insert((remote.clone(), protocol.clone()), notifications_sink);
@@ -1686,6 +1966,14 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 						metrics.notifications_streams_closed_total
 							.with_label_values(&[&protocol[..]]).inc();
 					}
+
+					if protocol.as_ref() == GROUP_MESSAGE_PROTOCOL {
+						log::info!("NotificationStreamClosed:{},peer:{:?}",protocol.as_ref(),remote.clone());
+						let mut buckets = this.service.buckets.lock();
+						buckets.iter_mut().for_each(|(_g,tb)|{
+							tb.PeerDisconnected(&remote);
+						});
+					}
 					this.event_streams.send(Event::NotificationStreamClosed {
 						remote: remote.clone(),
 						protocol: protocol.clone(),
@@ -1693,6 +1981,7 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 					{
 						let mut peers_notifications_sinks = this.peers_notifications_sinks.lock();
 						peers_notifications_sinks.remove(&(remote.clone(), protocol));
+
 					}
 				},
 				Poll::Ready(SwarmEvent::Behaviour(BehaviourOut::NotificationsReceived { remote, messages })) => {
@@ -1703,6 +1992,73 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 								.observe(message.len() as f64);
 						}
 					}
+
+                    let mut group_messages = vec![];
+					let messages =
+					messages.into_iter().filter_map(|(protocol,message)|{
+                        let proto = protocol.as_ref();
+						if GROUP_MESSAGE_PROTOCOL == proto {
+
+							group_messages.push(message);
+							None
+						}
+						else{
+							Some((protocol,message))
+						}
+
+					}).collect::<Vec<_>>();
+
+					for message in group_messages {
+						let mut data = message.to_vec();
+						let mut msg = <GroupMessage::<B> as Decode>::decode(&mut &data[..]).unwrap();
+
+						let group_id = msg.get_group_id();
+						let ttl = msg.ttl.unwrap_or(1);
+						let sender = &msg.sender;
+						let sender = PeerId::from_bytes(sender.clone()).unwrap();
+						{
+							let mut group_members = this.service.group_members.lock();
+							if let Some(members) = group_members.get_mut(&group_id) {
+								if members.iter().find(|(p,_)|p == &sender).is_none() {
+									log::warn!("notifi found group member:{:?}",&sender);
+									members.push((sender,String::new()));
+								}
+							}
+						}
+						let hashed = &msg.hash;
+						//forward..
+						if !this.know_hashed_message.contains(&hashed.as_ref().to_vec()) {
+							let content = &msg.data;
+							if content.is_none() {
+								this.pending_get_message_content.push_back((msg,Instant::now() - core::time::Duration::from_secs(60)));
+							}
+							else{
+								this.event_streams.send(Event::NotificationsReceived {
+									remote:remote.clone(),
+									messages:vec![(GROUP_MESSAGE_PROTOCOL.into(),message)],
+								});
+								let cnt = content.clone().unwrap();
+								this.know_hashed_message.put(hashed.as_ref().to_vec(),cnt);
+								msg.ttl = Some(ttl.max(1) - 1);
+								log::debug!("small group message forward,ttl:{}",ttl);
+								this.service.clone().on_notifi_message(msg);
+							}
+						}
+						else if ttl > 0 {
+							log::debug!("notifi known message ttl:{}",ttl);
+							msg.ttl = Some(ttl - 1);
+							msg.sender = this.service.local_peer_id.clone().into_bytes();
+							this.service.clone().on_notifi_message(msg);
+						}
+						else{
+							log::debug!("ttl is zero");
+						}
+						let local_groups = this.service.local_groups.lock();
+						if !local_groups.contains(&group_id) {
+							log::warn!("not my group:{}",&group_id);
+						}
+					}
+
 					this.event_streams.send(Event::NotificationsReceived {
 						remote,
 						messages,
@@ -1722,52 +2078,26 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
                     let copy_event = event.clone();
 					this.event_streams.send(Event::Dht(copy_event));
 					match event {
-						DhtEvent::ValueFound(vals) => {
-							for (k,data) in vals {
-								let key = k.to_vec();
-								let (_peer_id,proto) = key.split_at(key.len()-8);
-								if proto == &[1_u8; 8] {
-									//is group query
-									if let Ok(ids) = String::from_utf8(data){
-										this.service.clone().on_group_member(k,Some(ids));
-									};
-								}
+						DhtEvent::ValueFound(peers) => {
+							log::debug!("found peers {} for a group",&peers.len());
+							for (group,peer) in peers {
+                                // discovery
+								this.service.on_group_member(String::from_utf8(group.to_vec()).unwrap(),PeerId::from_bytes(peer).unwrap());
 							}
 						},
 						DhtEvent::ValueNotFound(k) =>{
-							let key = k.to_vec();
-							let (peer_id,proto) = key.split_at(key.len()-8);
-							if proto == &[1_u8; 8] {
-								log::warn!("group not found:{:?}",PeerId::from_bytes(peer_id.to_vec()).unwrap());
-								this.pending_get_group.push_back((k,Instant::now()));
-							}
+							//Retry...
 						},
 						DhtEvent::ValuePut(key) =>{
-							let k = key.to_vec();
-							let (peer_id,proto) = k.split_at(k.len()-8);
-							if proto == &[1_u8; 8] {
-								this.pending_put_group.retain(|(k,_data,_)| {
-
-									k != &key
-								});
-								this.service.clone().on_local_join(key);
-								log::debug!("ValuePut---->for peer: {:?}",PeerId::from_bytes(peer_id.to_vec()).unwrap());
-							}
-
-
+							// log::info!("ValuePut success:{:?}",&key);
+							let delay = rand::thread_rng().gen_range(0,60);
+							let delay = std::time::Duration::from_secs(delay);
+							this.pending_put_group.push_back((key.clone(),Instant::now() - delay));
+							this.pending_get_group.push_back((key,Instant::now()));
 						},
 						DhtEvent::ValuePutFailed(key) =>{
-							let k = key.to_vec();
-							let (peer_id,proto) = k.split_at(k.len()-8);
-							if proto == &[1_u8; 8] {
-								this.pending_put_group.retain(|(k,data,_)| {
-									if &key == k {
-										log::warn!("{}",String::from_utf8(data.clone()).unwrap());
-									}
-									true
-								});
-								log::debug!("ValuePutFailed---->for peer: {:?}",PeerId::from_bytes(peer_id.to_vec()).unwrap());
-							}
+                            // retry...after 30s
+							this.pending_put_group.push_back((key,Instant::now()));
 						}
 					}
 
@@ -1778,8 +2108,57 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 						ConnectedPoint::Dialer { .. } => "out",
 						ConnectedPoint::Listener { .. } => "in",
 					};
-					//[ADD] query peer group from kad if is out
-					this.service.clone().get_peer_group(peer_id,direction.to_string());
+					// {
+					// 	//[ADD] query peer group from kad if is out
+					// 	if !this.know_peer_group.contains_key(&peer_id) {
+					// 		this.service.clone().get_peer_group(peer_id,direction.to_string());
+					// 	}
+					// 	else{
+					// 		log::debug!("group know {:?}",peer_id);
+					// 	}
+					// }
+
+					{
+                        let mut peer_core = 0;
+						let mut group_members = this.service.group_members.lock();
+						let mut buckets = this.service.buckets.lock();
+						group_members.iter_mut().for_each(|(g,members)|{
+							if members.is_empty() {
+								log::info!("group {} members is empty",g);
+							}
+							else{
+								log::debug!("group {} members is size:{}",g,members.len());
+							}
+							let mut in_group_num = 0;
+							members.retain(|(p,_)| {
+								let has = p == &peer_id;
+								if has {
+									in_group_num +=1;
+								}
+								!has
+							});
+							if in_group_num > 0 {
+								members.push((peer_id.clone(),direction.to_string()));
+								peer_core +=1;
+							}
+							else{
+								buckets.iter_mut().for_each(|(gg,tb)|{
+									if gg == g {
+										tb.PeerDisconnected(&peer_id);
+									}
+								});
+							}
+
+						});
+						if peer_core == 0 {
+							// log::warn!("other group:{:?}",&peer_id);
+							this.service.report_peer(peer_id,ReputationChange::new(-(1 << 12),"other group"));
+						}
+						else {
+							this.service.report_peer(peer_id,ReputationChange::new(peer_core, "our group"));
+						}
+
+					}
 
 					if let Some(metrics) = this.metrics.as_ref() {
 
@@ -1797,13 +2176,11 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 						ConnectedPoint::Listener { .. } => "in",
 					};
 					// ADD remove peer from group members
-					if direction == "out" {
-						let mut group_members = this.service.group_members.lock();
-						let _ = group_members.iter_mut().flat_map(|(_,members)|{
-                           members.retain(|m|m != &peer_id);
-						   members.into_iter()
-						}).collect::<Vec<_>>();
-					}
+					let mut group_members = this.service.group_members.lock();
+					let _ = group_members.iter_mut().flat_map(|(_,members)|{
+					   members.retain(|(m,_)|m != &peer_id);
+					   members.into_iter()
+					}).collect::<Vec<_>>();
 					if let Some(metrics) = this.metrics.as_ref() {
 
 						let reason = match cause {
@@ -1966,7 +2343,12 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 			metrics.pending_connections.set(
 				Swarm::network_info(&this.network_service).connection_counters().num_pending() as u64
 			);
-			log::info!("{:?}",metrics);
+			// log::info!("{:?}",metrics);
+			// log::info!("distinct_peers_connections_opened/closed_total-->{}/{}",metrics.distinct_peers_connections_opened_total.get(),metrics.distinct_peers_connections_closed_total.get());
+			// log::info!("                    incoming_connections_total-->{}",metrics.incoming_connections_total.get());
+			// log::info!("     notifications_streams_opened/closed_total-->{:?}/{:?}",metrics.notifications_streams_opened_total,metrics.notifications_streams_closed_total);
+			// log::trace!("",metrics.)
+
 		}
 
 		Poll::Pending

@@ -180,7 +180,7 @@ impl DiscoveryConfig {
 				// auto-insertion and instead add peers manually.
 				config.set_kbucket_inserts(KademliaBucketInserts::Manual);
 				config.disjoint_query_paths(kademlia_disjoint_query_paths);
-
+				config.set_replication_factor(NonZeroUsize::new(20).unwrap());
 				let store = MemoryStore::new(local_peer_id.clone());
 				let mut kad = Kademlia::with_config(local_peer_id.clone(), store, config);
 
@@ -324,7 +324,7 @@ impl DiscoveryBehaviour {
 	/// A corresponding `ValueFound` or `ValueNotFound` event will later be generated.
 	pub fn get_value(&mut self, key: &record::Key) {
 		for k in self.kademlias.values_mut() {
-			k.get_record(key, Quorum::One);
+			k.get_record(key, Quorum::All);
 		}
 	}
 
@@ -334,7 +334,7 @@ impl DiscoveryBehaviour {
 	/// A corresponding `ValuePut` or `ValuePutFailed` event will later be generated.
 	pub fn put_value(&mut self, key: record::Key, value: Vec<u8>) {
 		for k in self.kademlias.values_mut() {
-			if let Err(e) = k.put_record(Record::new(key.clone(), value.clone()), Quorum::All) {
+			if let Err(e) = k.put_record(Record::new(key.clone(), value.clone()), Quorum::N(NonZeroUsize::new(3).unwrap())) {
 				warn!(target: "sub-libp2p", "Libp2p => Failed to put record: {:?}", e);
 				self.pending_events.push_back(DiscoveryOut::ValuePutFailed(key.clone(), Duration::from_secs(0)));
 			}

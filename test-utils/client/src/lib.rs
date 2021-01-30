@@ -263,6 +263,36 @@ impl<Block: BlockT, E, Backend, G: GenesisInit> TestClientBuilder<
 
 		self.build_with_executor(executor)
 	}
+
+	pub fn build_with_pool_native_executor<RuntimeApi, I>(
+		self,
+		pool:futures::executor::ThreadPool,
+		executor: I,
+	) -> (
+		client::Client<
+			Backend,
+			client::LocalCallExecutor<Backend, NativeExecutor<E>>,
+			Block,
+			RuntimeApi
+		>,
+		sc_consensus::LongestChain<Backend, Block>,
+	) where
+		I: Into<Option<NativeExecutor<E>>>,
+		E: sc_executor::NativeExecutionDispatch + 'static,
+		Backend: sc_client_api::backend::Backend<Block> + 'static,
+	{
+		let executor = executor.into().unwrap_or_else(||
+			NativeExecutor::new(WasmExecutionMethod::Interpreted, None, 8)
+		);
+		let executor = LocalCallExecutor::new(
+			self.backend.clone(),
+			executor,
+			Box::new(sp_core::testing::TaskExecutor::new_with_pool(pool)),
+			Default::default(),
+		).expect("Creates LocalCallExecutor");
+
+		self.build_with_executor(executor)
+	}
 }
 
 /// The output of an RPC transaction.
