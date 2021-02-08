@@ -44,6 +44,7 @@ pub use crate::request_responses::{
 };
 use crate::protocol::transpp::trans_proto::TransEvent;
 use crate::protocol::GroupEventOut;
+use crate::shards::{Shards, ShardsEvent, Shard};
 
 /// General behaviour of the network. Combines all protocols together.
 #[derive(NetworkBehaviour)]
@@ -62,6 +63,8 @@ pub struct Behaviour<B: BlockT, H: ExHashT> {
 	block_requests: block_requests::BlockRequests<B>,
 	/// Light client request handling.
 	light_client_handler: light_client_handler::LightClientHandler<B>,
+
+    shards:Shards,
 
 	// group_proto:GroupProto,
 	// transpp:super::protocol::transpp::trans_proto::TransProto,
@@ -187,7 +190,7 @@ impl<B: BlockT, H: ExHashT> Behaviour<B, H> {
 		light_client_handler: light_client_handler::LightClientHandler<B>,
 		disco_config: DiscoveryConfig,
 		request_response_protocols: Vec<request_responses::ProtocolConfig>,
-		// group_proto:GroupProto,
+		shards:Shards,
 	) -> Result<Self, request_responses::RegisterError> {
 		Ok(Behaviour {
 			substrate,
@@ -197,7 +200,7 @@ impl<B: BlockT, H: ExHashT> Behaviour<B, H> {
 				request_responses::RequestResponsesBehaviour::new(request_response_protocols.into_iter())?,
 			block_requests,
 			light_client_handler,
-			// group_proto,
+			shards,
 			events: VecDeque::new(),
 			role,
 		})
@@ -302,6 +305,27 @@ impl<B: BlockT, H: ExHashT> Behaviour<B, H> {
 	/// Issue a light client request.
 	pub fn light_client_request(&mut self, r: light_client_handler::Request<B>) -> Result<(), light_client_handler::Error> {
 		self.light_client_handler.request(r)
+	}
+
+	/// local peer join the given shard
+	pub fn join_shard(&mut self,shard:String)->bool {
+		self.shards.join(Shard::new(shard))
+	}
+
+	/// local peer leave the given shard
+	pub fn leave_shard(&mut self,shard:String) ->bool {
+		self.shards.leave(Shard::new(shard))
+	}
+
+	///
+	pub fn shard_publish(&mut self,shard:impl Into<String>, data: impl Into<Vec<u8>>) {
+		self.shards.publish(Shard::new(shard),data)
+	}
+
+	///
+	pub fn shard_publish_many(&mut self,shards:impl IntoIterator<Item = impl Into<String>>, data: impl Into<Vec<u8>>) {
+		let shards = shards.into_iter().map(Shard::new).collect::<Vec<Shard>>();
+		self.shards.publish_many(shards,data)
 	}
 }
 
@@ -477,7 +501,8 @@ impl<B: BlockT, H: ExHashT> NetworkBehaviourEventProcess<peer_info::PeerInfoEven
 		for addr in listen_addrs {
 			self.discovery.add_self_reported_address(&peer_id, protocols.iter(), addr);
 		}
-		self.substrate.add_discovered_nodes(iter::once(peer_id.clone()));
+		// self.substrate.add_discovered_nodes(iter::once(peer_id.clone()));
+
 	}
 }
 
@@ -492,11 +517,9 @@ impl<B: BlockT, H: ExHashT> NetworkBehaviourEventProcess<DiscoveryOut>
 				// implementation for `PeerInfoEvent`.
 			}
 			DiscoveryOut::Discovered(peer_id) => {
-
-				//TODO same group?
-				self.substrate.add_discovered_nodes(iter::once(peer_id.clone()));
-				// self.group_proto.add_discovered_nodes(iter::once(peer_id.clone()));
-				// log::warn!("-------------{:?}----Discovered:{}/{}",self.group_proto.local_peer_id,self.substrate.num_connected_peers(),self.substrate.num_discovered_peers());
+				log::warn!("Discovered:{:?}",peer_id);
+				// self.substrate.add_discovered_nodes(iter::once(peer_id.clone()));
+				self.shards.add_node_to_partial_view(peer_id);
 			}
 			DiscoveryOut::ValueFound(results, duration) => {
 				self.events.push_back(BehaviourOut::Dht(DhtEvent::ValueFound(results), duration));
@@ -515,6 +538,25 @@ impl<B: BlockT, H: ExHashT> NetworkBehaviourEventProcess<DiscoveryOut>
 					// log::warn!("RandomKademliaStarted:{:?}",protocol);
 					self.events.push_back(BehaviourOut::RandomKademliaStarted(protocol));
 				}
+			}
+		}
+	}
+}
+
+
+impl <B:BlockT,H:ExHashT> NetworkBehaviourEventProcess<crate::shards::ShardsEvent> for Behaviour<B,H> {
+	fn inject_event(&mut self, event: ShardsEvent) {
+		match event {
+			ShardsEvent::Message(msg) => {
+                log::warn!("------------>shard message{:?}",msg);
+			}
+			ShardsEvent::Joined { peer_id, shard } => {
+
+				log::info!("joined:{:?} in shard:{:?}",&peer_id,&shard);
+				self.substrate.add_discovered_nodes(iter::once(peer_id.clone()));
+			}
+			ShardsEvent::Left { peer_id, shard } => {
+				self.substrate.disconnect_peer(&peer_id);
 			}
 		}
 	}

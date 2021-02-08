@@ -1028,6 +1028,7 @@ impl<B: BlockT, H: ExHashT> Protocol<B, H> {
 			return;
 		}
 		if let Some(transaction) = self.transaction_pool.transaction(hash) {
+
 			let propagated_to = self.do_propagate_transactions(&[(hash.clone(), transaction)]);
 			self.transaction_pool.on_broadcasted(propagated_to);
 		}

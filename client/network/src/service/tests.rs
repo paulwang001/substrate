@@ -175,7 +175,7 @@ fn build_group_nodes(
 	for g in 0..group_count {
 		let watch = b_watch.clone();
 
-		let listen_addr = config::build_multiaddr![Ip4([192, 168, 1, 27]), Tcp(4000_u16 + g as u16)];
+		let listen_addr = config::build_multiaddr![Ip4([192, 168, 1, 30]), Tcp(4000_u16 + g as u16)];
 		let (mut node1, events_stream1) = build_test_full_node(config::NetworkConfiguration {
 			notifications_protocols: vec![PROTOCOL_TEST],
 			listen_addresses: vec![listen_addr.clone()],
@@ -199,13 +199,13 @@ fn build_group_nodes(
 	for (node1,_,group_addr) in groups.iter() {
 		let local = &node1.local_peer_id;
 		let group_id = format!("shard{}0",gx);
-		node1.join_group(group_id.clone()).unwrap();
-		async_std::task::sleep(Duration::from_millis(20));
-
+		node1.shard_join(group_id.clone());
+		// node1.join_group(group_id.clone()).unwrap();
+		// std::thread::sleep(Duration::from_millis(20));
 		for x in 0..group_node_count {
 			let watch = n_watch.clone();
 			// let listen1_addr = config::build_multiaddr![Ip4([0, 0, 0, 0]), Tcp(0_u16)];
-			let listen1_addr = config::build_multiaddr![Ip4([192, 168, 1, 27]), Tcp(8000_u16 + (gx * 100) + x as u16)];
+			let listen1_addr = config::build_multiaddr![Ip4([192, 168, 1, 30]), Tcp(8000_u16 + (gx * 100) + x as u16)];
 			let (mut node2, _events_stream2) = build_test_full_node(config::NetworkConfiguration {
 				notifications_protocols: vec![PROTOCOL_TEST],
 				listen_addresses: vec![listen1_addr.clone()],
@@ -228,9 +228,10 @@ fn build_group_nodes(
 				.. config::NetworkConfiguration::new_local()
 			},pool.clone());
 			node2.set_group_role(GroupRoles::Shard);
-			async_std::task::sleep(Duration::from_millis(20));
+			// async_std::task::sleep(Duration::from_millis(20)).await;
 			let group_id = format!("shard{}{}",gx,x % 4);
-			node2.join_group(group_id).unwrap();
+			// node2.join_group(group_id).unwrap();
+			node2.shard_join(group_id.clone());
 			// node2.set_watcher(Some(watch));
 			nodes.push((local.clone(),node2));
 		}
@@ -608,7 +609,7 @@ fn ensure_public_addresses_consistent_with_transport_not_memory() {
 fn group_tests() {
 	env_logger::init();
     let (tx,rx) = unbounded();
-	let ret = build_group_nodes(2,90,Some(tx.clone()),Some(tx.clone()));
+	let ret = build_group_nodes(1,6,Some(tx.clone()),Some(tx.clone()));
 	let (mut events,nodes) = ret.unwrap();
 	let mut boots = vec![];
 	for (b,_) in events.iter() {
@@ -647,7 +648,7 @@ fn group_tests() {
 		loop {
 			log::info!("-------------pub-----------------");
 			{
-				async_std::task::sleep(Duration::from_millis( 1 * 1000)).await;
+				async_std::task::sleep(Duration::from_millis( 30 * 1000)).await;
 				let x = counter % nodes.len();
 				let (_,n) = &nodes[x];
 				let groups = n.local_groups.lock();
@@ -657,13 +658,14 @@ fn group_tests() {
 					let mut nums=vec![0_u8;1024];
                     rng.fill_bytes(&mut nums);
 					log::warn!("node pub....to:{}----{:?}",tg,n.local_peer_id.clone());
-					n.publish_message(tg.clone(),nums);
+					// n.publish_message(tg.clone(),nums);
+					n.shard_publish(tg.clone(),nums);
 				}
 
 
 			}
 			{
-				async_std::task::sleep(Duration::from_millis( 1 * 1000)).await;
+				async_std::task::sleep(Duration::from_millis( 30 * 1000)).await;
 				let y = counter % boots.len();
 				let boot = &boots[y];
 				let groups = boot.local_groups.lock();
@@ -671,7 +673,8 @@ fn group_tests() {
 					let mut nums=vec![0_u8;246];
 					rng.fill_bytes(&mut nums);
 					log::warn!("boot pub....to:{}----{:?}",tg,boot.local_peer_id.clone());
-					boot.publish_message(tg.clone(),nums);
+					// boot.publish_message(tg.clone(),nums);
+					boot.shard_publish(tg.clone(),nums);
 				}
 				counter = counter + 1;
 			}

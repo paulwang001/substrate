@@ -23,7 +23,7 @@
 #   - prometheus: localhost:9090
 
 
-version: "3.7"
+version: "3.3"
 services:
 
   validator-a:
@@ -36,7 +36,7 @@ services:
     networks:
       - network-a
     command:
-      # Local node id: QmRpheLN4JWdAnY7HGJfWFNbfkQCb6tFf4vvA6hgjMZKrR
+      # Local node id: 12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp
       - "--node-key"
       - "0000000000000000000000000000000000000000000000000000000000000001"
       - "--base-path"
@@ -47,9 +47,9 @@ services:
       - "--validator"
       - "--alice"
       - "--sentry-nodes"
-      - "/dns/sentry-a/tcp/30333/p2p/QmV7EhW6J6KgmNdr558RH1mPx2xGGznW7At4BhXzntRFsi"
+      - "/dns/sentry-a/tcp/30333/p2p/12D3KooWSCufgHzV4fCwRijfH2k3abrpAJxTKxEvN1FDuRXA2U9x"
       - "--reserved-nodes"
-      - "/dns/sentry-a/tcp/30333/p2p/QmV7EhW6J6KgmNdr558RH1mPx2xGGznW7At4BhXzntRFsi"
+      - "/dns/sentry-a/tcp/30333/p2p/12D3KooWSCufgHzV4fCwRijfH2k3abrpAJxTKxEvN1FDuRXA2U9x"
       # Not only bind to localhost.
       - "--unsafe-ws-external"
       - "--unsafe-rpc-external"
@@ -74,7 +74,7 @@ services:
       - network-a
       - internet
     command:
-      # Local node id: QmV7EhW6J6KgmNdr558RH1mPx2xGGznW7At4BhXzntRFsi
+      # Local node id: 12D3KooWSCufgHzV4fCwRijfH2k3abrpAJxTKxEvN1FDuRXA2U9x
       - "--node-key"
       - "0000000000000000000000000000000000000000000000000000000000000003"
       - "--base-path"
@@ -83,11 +83,11 @@ services:
       - "--port"
       - "30333"
       - "--sentry"
-      - "/dns/validator-a/tcp/30333/p2p/QmRpheLN4JWdAnY7HGJfWFNbfkQCb6tFf4vvA6hgjMZKrR"
+      - "/dns/validator-a/tcp/30333/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp"
       - "--reserved-nodes"
-      - "/dns/validator-a/tcp/30333/p2p/QmRpheLN4JWdAnY7HGJfWFNbfkQCb6tFf4vvA6hgjMZKrR"
+      - "/dns/validator-a/tcp/30333/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp"
       - "--bootnodes"
-      - "/dns/validator-b/tcp/30333/p2p/QmSVnNf9HwVMT1Y4cK1P6aoJcEZjmoTXpjKBmAABLMnZEk"
+      - "/dns/validator-b/tcp/30333/p2p/12D3KooWHdiAxVd8uMQR1hGWXccidmfCwLqcMpGwR6QcTP6QRMuD"
       - "--no-telemetry"
       - "--rpc-cors"
       - "all"
@@ -107,7 +107,7 @@ services:
     networks:
       - internet
     command:
-      # Local node id: QmSVnNf9HwVMT1Y4cK1P6aoJcEZjmoTXpjKBmAABLMnZEk
+      # Local node id: 12D3KooWHdiAxVd8uMQR1hGWXccidmfCwLqcMpGwR6QcTP6QRMuD
       - "--node-key"
       - "0000000000000000000000000000000000000000000000000000000000000002"
       - "--base-path"
@@ -118,9 +118,9 @@ services:
       - "--validator"
       - "--bob"
       - "--bootnodes"
-      - "/dns/validator-a/tcp/30333/p2p/QmRpheLN4JWdAnY7HGJfWFNbfkQCb6tFf4vvA6hgjMZKrR"
+      - "/dns/validator-a/tcp/30333/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp"
       - "--bootnodes"
-      - "/dns/sentry-a/tcp/30333/p2p/QmV7EhW6J6KgmNdr558RH1mPx2xGGznW7At4BhXzntRFsi"
+      - "/dns/sentry-a/tcp/30333/p2p/12D3KooWSCufgHzV4fCwRijfH2k3abrpAJxTKxEvN1FDuRXA2U9x"
       - "--no-telemetry"
       - "--rpc-cors"
       - "all"

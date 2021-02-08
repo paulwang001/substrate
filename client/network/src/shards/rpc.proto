@@ -1,0 +1,20 @@
+syntax = "proto2";
+
+package shards.pb;
+
+message RPC {
+	repeated ShardOpts shards = 1;
+	repeated Message publish = 2;
+
+	message ShardOpts {
+		optional bool join = 1; // join or leave
+		optional string shard_id = 2;
+	}
+}
+
+message Message {
+	optional bytes from = 1;
+	optional bytes data = 2;
+	optional bytes seqno = 3;
+	repeated string shard_ids = 4;
+}

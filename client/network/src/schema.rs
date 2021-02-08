@@ -23,4 +23,7 @@ pub mod v1 {
 	pub mod light {
 		include!(concat!(env!("OUT_DIR"), "/api.v1.light.rs"));
 	}
+	pub mod shards {
+		include!(concat!(env!("OUT_DIR"), "/shards.pb.rs"));
+	}
 }

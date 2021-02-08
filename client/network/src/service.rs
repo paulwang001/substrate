@@ -102,10 +102,11 @@ use codec::{Encode,Decode};
 use codec::EncodeAsRef;
 pub use behaviour::{ResponseFailure, InboundFailure, RequestFailure, OutboundFailure};
 use smallvec::alloc::collections::VecDeque;
-use futures::channel::mpsc::UnboundedSender;
+use futures::channel::mpsc::{UnboundedSender, unbounded};
 use crate::config::{RequestResponseConfig, IncomingRequest};
 use futures::channel::oneshot::Canceled;
 use rand::Rng;
+use crate::shards::{ShardsMessage, Shards};
 
 mod metrics;
 mod out_events;
@@ -389,7 +390,9 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 				request_timeout: core::time::Duration::from_secs(10),
 				inbound_queue: Some(tx_qry)
 			});
+			// let (tx_shards,rx_shards) = unbounded();
 			let mut behaviour = {
+				let shards = Shards::new(local_peer_id.clone());
 				let result = Behaviour::new(
 					protocol,
 					params.role,
@@ -399,6 +402,7 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 					light_client_handler,
 					discovery_config,
 					rr_protocols,
+					shards,
 				);
 
 				match result {
@@ -1161,6 +1165,10 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkService<B, H> {
 		*r = role;
 	}
 
+	pub fn join_shard(&self,shard_id:String){
+
+	}
+
 	pub fn join_group(&self,group_id:String) ->Result<(),String> {
 		let mut local_groups = self.local_groups.lock();
         if local_groups.contains(&group_id) {
@@ -1291,6 +1299,24 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkService<B, H> {
         if let Err(e) = self.to_worker.unbounded_send(ServiceToWorkerMsg::Message(msg)){
 			log::warn!("{:?}",e);
 		}
+	}
+
+	pub fn shard_join(&self,shard_id:String) {
+		log::info!("join---------{}",&shard_id);
+		self.local_groups.lock().insert(shard_id.clone());
+		self.to_worker.unbounded_send(ServiceToWorkerMsg::ShardJoin(shard_id)).expect("");
+	}
+
+	pub fn shard_leave(&self,shard_id:String) {
+		self.local_groups.lock().remove(&shard_id);
+		self.to_worker.unbounded_send(ServiceToWorkerMsg::ShardLeave(shard_id)).expect("");
+	}
+
+	pub fn shard_publish(&self,shard_id:String,data:Vec<u8>) {
+		self.to_worker.unbounded_send(ServiceToWorkerMsg::ShardMessage {
+			shards:vec![shard_id],
+			data
+		}).expect("");
 	}
 
 	pub fn on_notifi_message(&self,msg:GroupMessage<B>){
@@ -1475,6 +1501,12 @@ enum ServiceToWorkerMsg<B: BlockT, H: ExHashT> {
 	DisconnectPeer(PeerId),
 	NewBestBlockImported(B::Hash, NumberFor<B>),
 	Message(GroupMessage<B>),
+	ShardJoin(String),
+	ShardLeave(String),
+	ShardMessage {
+		shards: Vec<String>,
+		data: Vec<u8>,
+	}
 }
 
 /// Main network worker. Must be polled in order for the network to advance.
@@ -1672,6 +1704,19 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 					});
 
 				},
+				ServiceToWorkerMsg::ShardJoin(shard_id) => {
+					if !this.network_service.join_shard(shard_id){
+						//TODO join retry
+					}
+				},
+				ServiceToWorkerMsg::ShardLeave(shard_id) => {
+					if !this.network_service.leave_shard(shard_id){
+						//TODO leave retry
+					}
+				},
+				ServiceToWorkerMsg::ShardMessage { shards, data } =>{
+                    this.network_service.shard_publish_many(shards,data);
+				}
 			}
 		}
 
